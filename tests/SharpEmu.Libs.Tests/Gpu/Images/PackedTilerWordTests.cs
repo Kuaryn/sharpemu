@@ -123,6 +123,124 @@ public sealed class PackedTilerWordTests(HeadlessVulkanFixture fixture) : IClass
     }
 
     [Fact]
+    public void PackedDispatchRejectsTheActualWorkgroupCountBeforeBinding()
+    {
+        var gpu = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(gpu)) return;
+        using var fatal = new FatalScope();
+        using var harness = new ImageTestHarness(gpu);
+        Assert.True(TileGeometry.TryGetBlockLayout(TileBlockKind.Standard4KB3D, 1, out var block));
+        var local = TilerShaders.BlockCopyWorkgroupSize((TilerBlockShape)block.Kind, 1, true, true);
+        var width = local.X;
+        var height = ((ulong)harness.Device.MaxComputeWorkGroupCount.Y + 1) * local.Y;
+        var rows = (height + block.BlockHeight - 1) / block.BlockHeight;
+        // A device with a very large dispatch limit hits the existing capacity guard first.
+        if (height > uint.MaxValue || width * height > uint.MaxValue || rows * block.BlockSize > uint.MaxValue) return;
+        var transfer = new TileTransfer
+        {
+            Kind = block.Kind,
+            BytesPerElement = 1,
+            Width = width,
+            Height = (uint)height,
+            Depth = 1,
+            Pitch = width,
+            LinearSize = width * height,
+            TiledSize = rows * block.BlockSize,
+        };
+        var source = harness.Upload(new byte[4]);
+        var target = harness.CreateDeviceLocalBuffer(4);
+        harness.Run(() => Assert.Throws<SchedulerFatalException>(() => harness.Tiler.Tile(source.Handle, 0,
+            transfer.LinearSize, target.Handle, 0, transfer.TiledSize, new[] { transfer })));
+        Assert.Contains(fatal.Messages, message => message.Contains("exceeds the workgroup limits"));
+        Console.WriteLine($"Rejected packed dispatch with {height / local.Y} Y groups against limit {harness.Device.MaxComputeWorkGroupCount.Y}");
+        harness.AssertNoValidationMessages();
+    }
+
+    [Fact]
+    public void NativeProductionTransfersMatchOracleAcrossBlockAndSliceBoundaries()
+    {
+        var gpu = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(gpu)) return;
+        using var harness = new ImageTestHarness(gpu);
+        var count = 0;
+        foreach (var kind in Enum.GetValues<TileBlockKind>())
+            foreach (var bytes in new[] { 1u, 2u })
+            {
+                Assert.True(TileGeometry.TryGetBlockLayout(kind, bytes, out var block));
+                for (var variant = 0; variant < 9; variant++)
+                {
+                    var tail = variant >= 6;
+                    if (tail && kind == TileBlockKind.Standard256B) continue;
+                    var wordWidth = 4 / bytes;
+                    var width = variant == 1 ? 1u : variant == 2 ? block.BlockWidth + wordWidth : wordWidth;
+                    var height = variant == 0 || variant == 8 ? 1u : variant == 2 ? block.BlockHeight + 1 : 5u;
+                    var depth = block.BlockDepth == 1 || variant == 0 ? 1u : tail ? block.BlockDepth : block.BlockDepth + 1;
+                    var pitch = width + (variant == 4 ? 1u : wordWidth);
+                    var slice = (ulong)pitch * bytes * height + (variant == 5 ? bytes : 4u);
+                    var prefix = variant == 3 ? bytes : 4u;
+                    var columns = tail ? 1u : (width + block.BlockWidth - 1) / block.BlockWidth;
+                    var rows = tail ? 1u : (height + block.BlockHeight - 1) / block.BlockHeight;
+                    var slabs = tail ? 1u : (depth + block.BlockDepth - 1) / block.BlockDepth;
+                    var transfer = new TileTransfer
+                    {
+                        Kind = kind,
+                        BytesPerElement = bytes,
+                        Width = width,
+                        Height = height,
+                        Depth = depth,
+                        Pitch = pitch,
+                        LinearSliceStride = slice,
+                        LinearOffset = prefix,
+                        LinearSize = slice * depth,
+                        TiledOffset = prefix,
+                        TiledSize = (ulong)columns * rows * slabs * block.BlockSize,
+                        TiledWidth = columns * block.BlockWidth,
+                        TiledHeight = rows * block.BlockHeight,
+                        Tail = tail,
+                        TailX = variant == 7 ? 1u : variant == 8 ? block.BlockWidth - wordWidth : tail ? wordWidth : 0u,
+                        TailY = variant == 8 ? block.BlockHeight - 1 : tail ? 1u : 0u,
+                        SurfaceZ = variant == 2 && kind is TileBlockKind.RenderTarget64KB or TileBlockKind.RenderTarget64KBGen5 or TileBlockKind.Depth64KB ? 13u : 0u,
+                    };
+                    var linearCapacity = (transfer.LinearOffset + transfer.LinearSize + 7) & ~3UL;
+                    var tiledCapacity = (transfer.TiledOffset + transfer.TiledSize + 7) & ~3UL;
+                    var linear = ImageTestHarness.Pattern((int)linearCapacity, (uint)(count + 101));
+                    var tiled = ImageTestHarness.Pattern((int)tiledCapacity, (uint)(count + 103));
+                    var expectedTiled = Enumerable.Repeat((byte)0x5A, (int)tiledCapacity).ToArray();
+                    var expectedLinear = new byte[(int)linearCapacity];
+                    for (uint z = 0; z < depth; z++)
+                        for (uint y = 0; y < height; y++)
+                            for (uint x = 0; x < width; x++)
+                            {
+                                var bx = tail ? 0u : x / block.BlockWidth;
+                                var by = tail ? 0u : y / block.BlockHeight;
+                                var bz = tail ? 0u : z / block.BlockDepth;
+                                Assert.True(TileGeometry.TryGetBlockOffset(block, tail ? x + transfer.TailX : x % block.BlockWidth,
+                                    tail ? y + transfer.TailY : y % block.BlockHeight, z % block.BlockDepth, out var offset));
+                                Assert.True(TileGeometry.TryGetBlockXor(block, bx, by, transfer.SurfaceZ, out var xor));
+                                var tiledIndex = (int)(prefix + (ulong)(bz * columns * rows + by * columns + bx) * block.BlockSize + (offset ^ xor));
+                                var linearIndex = (int)(prefix + z * slice + (ulong)y * pitch * bytes + x * bytes);
+                                Array.Copy(linear, linearIndex, expectedTiled, tiledIndex, bytes);
+                                Array.Copy(tiled, tiledIndex, expectedLinear, linearIndex, bytes);
+                            }
+
+                    var linearBuffer = harness.Upload(linear);
+                    var tiledBuffer = harness.Upload(tiled);
+                    using var target = new GpuBuffer(harness.Device, harness.Scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, tiledCapacity);
+                    target.Mapped.Fill(0x5A);
+                    target.Flush(0, target.Size);
+                    harness.Run(() => harness.Tiler.Tile(linearBuffer.Handle, 0, linearCapacity, target.Handle, 0, tiledCapacity, new[] { transfer }));
+                    Assert.True(expectedTiled.AsSpan().SequenceEqual(harness.ReadBack(target.Handle, 0, tiledCapacity)), $"Tile {kind}/{bytes}/{variant}");
+                    var detiled = harness.Run(() => harness.Tiler.Detile(tiledBuffer.Handle, 0, tiledCapacity, linearCapacity, new[] { transfer }));
+                    Assert.True(expectedLinear.AsSpan().SequenceEqual(harness.ReadBack(detiled.Buffer, detiled.Offset, detiled.Size)), $"Detile {kind}/{bytes}/{variant}");
+                    count += 2;
+                }
+            }
+        Assert.Equal(348, count);
+        Console.WriteLine($"Production tiler cases checked against CPU byte oracle: {count}");
+        harness.AssertNoValidationMessages();
+    }
+
+    [Fact]
     public void NativePackedCopiesPreservePrefixesPartialWordsRowsAndMipTails()
     {
         var gpu = fixture.Vulkan;
