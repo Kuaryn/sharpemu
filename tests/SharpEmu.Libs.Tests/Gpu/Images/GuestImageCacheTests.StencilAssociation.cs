@@ -14,12 +14,19 @@ namespace SharpEmu.Libs.Tests.Gpu.Images;
 public sealed partial class GuestImageCacheTests
 {
     [Theory]
-    [InlineData(false, 0)] // A new proxy already needs a guest upload.
-    [InlineData(true, 0)] // A clean native image must survive becoming a proxy.
-    [InlineData(true, 1)] // A tracked CPU update supersedes the native image.
-    [InlineData(true, 2)] // A buffer update supersedes the native image.
-    [InlineData(true, 3)] // A page-only invalidation leaves the plane unchanged.
-    public void StencilAssociation_PreservesSelectedPlane(bool materialize, int update)
+    [InlineData(false, 0, false)] // A new proxy already needs a guest upload.
+    [InlineData(true, 0, false)] // A clean native image must survive becoming a proxy.
+    [InlineData(true, 1, false)] // A tracked CPU update supersedes the native image.
+    [InlineData(true, 2, false)] // A buffer update supersedes the native image.
+    [InlineData(true, 3, false)] // A page-only invalidation leaves the plane unchanged.
+    [InlineData(true, 4, false)] // A changed maybe-dirty hash supersedes the native image.
+    [InlineData(false, 0, true)]
+    [InlineData(true, 0, true)]
+    [InlineData(true, 1, true)]
+    [InlineData(true, 2, true)]
+    [InlineData(true, 3, true)]
+    [InlineData(true, 4, true)]
+    public void StencilAssociation_PreservesSelectedPlane(bool materialize, int update, bool normalized)
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;
         using var harness = new CacheHarness(_vulkan);
@@ -34,7 +41,8 @@ public sealed partial class GuestImageCacheTests
         harness.Write(aAddress, a);
         harness.Write(bAddress, b);
 
-        var ordinary = LinearRequest(aAddress, 4, Format.R8Uint, GuestPixelFormat.Bits8UInt,
+        var ordinary = LinearRequest(aAddress, 4, normalized ? Format.R8Unorm : Format.R8Uint,
+            normalized ? GuestPixelFormat.Bits8UNorm : GuestPixelFormat.Bits8UInt,
             GuestImageType.Color2D, new Extent3D(4, 1, 1), 1, 1, 1);
         var aId = materialize ? harness.Acquire(ref ordinary) : default;
         if (materialize)
@@ -72,10 +80,15 @@ public sealed partial class GuestImageCacheTests
             a = [0x42, 0x42, 0x42, 0x42];
             harness.Worker.Run(() => harness.Cache.FillBuffer(aAddress, 4, 0x42424242, false));
         }
-        else if (update == 3)
+        else if (update is 3 or 4)
         {
             harness.Worker.Run(() => harness.Images.InvalidateMemory(aAddress + 16, 4));
             Assert.True(harness.Image(aId).IsMaybeCpuDirty);
+            if (update == 4)
+            {
+                a = [0x31, 0x72, 0xa5, 0xfe];
+                harness.Write(aAddress, a);
+            }
         }
 
         depth.Description.Stencil = new GuestSpan(aAddress, 4);
@@ -89,6 +102,7 @@ public sealed partial class GuestImageCacheTests
         Assert.Equal(depthId, harness.Acquire(ref depth));
         Assert.Equal(a, Stencil());
         harness.Shutdown();
+        _vulkan.AssertNoValidationMessages();
     }
 
     [Fact]
@@ -124,6 +138,7 @@ public sealed partial class GuestImageCacheTests
             harness.ReadImageBytes(harness.Image(depthId), ImageAspectFlags.StencilBit)[..4]);
         Assert.Equal(Bytes(0.75f, 0.75f, 0.75f, 0.75f), harness.ReadImageBytes(harness.Image(depthId), ImageAspectFlags.DepthBit));
         harness.Shutdown();
+        _vulkan.AssertNoValidationMessages();
     }
 
     [Theory]
@@ -207,5 +222,6 @@ public sealed partial class GuestImageCacheTests
             harness.ReadImageBytes(harness.Image(depthId), ImageAspectFlags.StencilBit)[..4]);
         Assert.Equal(depthBytes, harness.ReadImageBytes(harness.Image(depthId), ImageAspectFlags.DepthBit));
         harness.Shutdown();
+        _vulkan.AssertNoValidationMessages();
     }
 }
