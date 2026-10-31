@@ -174,8 +174,8 @@ internal static unsafe partial class VulkanVideoPresenter
         private readonly CommandStreamQueue _commandStream;
         private readonly EndOfPipeEvents _endOfPipeEvents = new();
         private EndOfPipe _endOfPipe = null!;
-        private AgcExports.CommandStreamTranslation _translation = null!;
-        private ICpuMemory _guestMemory = null!;
+        internal AgcExports.CommandStreamTranslation _translation = null!;
+        internal ICpuMemory _guestMemory = null!;
 
         public CommandStreamQueue CommandStream => _commandStream;
 
@@ -184,7 +184,9 @@ internal static unsafe partial class VulkanVideoPresenter
             var (_, guest, _) = RequireGuestMemory("command stream");
             _guestMemory = guest;
             _endOfPipe = new EndOfPipe(_endOfPipeEvents, this);
-            _translation = AgcExports.CreateCommandStreamTranslation(guest, this);
+            _recording = new RecordingHost(this);
+            _translation = AgcExports.CreateCommandStreamTranslation(((ICommandStreamHost)this).Memory, this);
+            CreateRenderWorkers();
         }
 
         public void EnqueueCommandStream(uint queue, ulong address, uint dwordCount, ulong submissionId, object? geometrySnapshots)
@@ -202,10 +204,175 @@ internal static unsafe partial class VulkanVideoPresenter
 
         // The command stream thread interprets the submissions; this thread runs what it hands over
         // until the budget ends or nothing is queued. Null until the first render tick.
-        private CommandThread? _commandThread;
+        internal CommandThread? _commandThread;
         private Action? _betweenCommandItems;
 
         private bool OnCommandThread => _commandThread is { IsProducerThread: true };
+
+        private static readonly int ResolveWorkerCount =
+            int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_RESOLVE_WORKERS"), out var resolveWorkers) && resolveWorkers >= 0
+                ? resolveWorkers
+                : Math.Clamp(Environment.ProcessorCount / 4, 1, 6);
+
+        private sealed class ResolveWorkerState
+        {
+            public Presenter? Owner;
+            public long Sequence;
+            public ResolveReadLog Reads = null!;
+            public CleanReadPages? CleanReads;
+        }
+
+        [ThreadStatic]
+        private static ResolveWorkerState? _resolveWorker;
+
+        private bool OnResolveWorker => _resolveWorker is { Sequence: not 0 } worker && ReferenceEquals(worker.Owner, this);
+
+        int ICommandStreamHost.ResolveWorkerCount => ResolveWorkerCount;
+
+        PendingCommandSignal ICommandStreamHost.CommandSignal => _relay.CommandSignal;
+
+        void ICommandStreamHost.BeginWorkerResolve(long sequence, ResolveReadLog reads)
+        {
+            var worker = _resolveWorker ??= new ResolveWorkerState();
+            if (!ReferenceEquals(worker.Owner, this))
+            {
+                worker.Owner = this;
+                worker.CleanReads = null;
+            }
+
+            worker.Sequence = sequence;
+            worker.Reads = reads;
+            reads.Version = _bufferCache.GpuModifiedVersion;
+            reads.Publications = _guestPublications.Ordinal;
+        }
+
+        void ICommandStreamHost.EndWorkerResolve()
+        {
+            var worker = _resolveWorker!;
+            worker.Sequence = 0;
+            worker.Reads = null!;
+        }
+
+        bool ICommandStreamHost.ValidateWorkerReads(ResolveReadLog reads)
+        {
+            var published = reads.Publications != _guestPublications.Ordinal;
+            if (!published && reads.Version == _bufferCache.GpuModifiedVersion)
+            {
+                return true;
+            }
+
+            Span<byte> current = stackalloc byte[256];
+            for (var index = 0; index < reads.Count; index++)
+            {
+                var bytes = reads.Bytes(index, out var address);
+                var size = (ulong)bytes.Length;
+                if (published && HasPendingMemoryPublication(address, size))
+                {
+                    return false;
+                }
+
+                if (!published && !_bufferCache.EverGpuWritten(address, size))
+                {
+                    continue;
+                }
+
+                if (_bufferCache.HasGpuDirtyBytes(address, size))
+                {
+                    return false;
+                }
+
+                var now = bytes.Length <= current.Length ? current[..bytes.Length] : new byte[bytes.Length];
+                if (!_guestMemory.TryRead(address, now) || !now.SequenceEqual(bytes))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        // A read for a draw resolving ahead of the stream: a range earlier GPU work may still write
+        // sends the draw to the stream thread; everything else reads with the stores before it applied.
+        private bool ReadOnResolveWorker(ulong address, Span<byte> destination)
+        {
+            var size = (ulong)destination.Length;
+            if (HasPendingMemoryPublication(address, size))
+            {
+                throw new SerialResolveRequiredException("pending publication read");
+            }
+
+            var worker = _resolveWorker!;
+            if (IsCleanReadPage(address, size) && TryReadAliasBytes(address, destination))
+            {
+                worker.Reads.Add(address, destination);
+                return true;
+            }
+
+            if (!_guestMemory.CanRead(address, size))
+            {
+                return false;
+            }
+
+            if (TryReadShadowForWorker(address, destination))
+            {
+                return true;
+            }
+
+            if (IsGpuOwnedForWorkerRead(address, size))
+            {
+                throw new SerialResolveRequiredException("gpu owned read");
+            }
+
+            if (IsPendingForWorker(address, size))
+            {
+                throw new SerialResolveRequiredException("pending write read");
+            }
+
+            if (!_commandThread!.ReadOverlayBefore(address, destination, worker.Sequence))
+            {
+                return false;
+            }
+
+            worker.Reads.Add(address, destination);
+            NoteCleanReadPage(address, size);
+            return true;
+        }
+
+        // A known GPU write before the draw serves the read as it does on the stream thread; a write
+        // marked between the two makes the known bytes stale, so the draw resolves in order instead.
+        private bool TryReadShadowForWorker(ulong address, Span<byte> destination)
+        {
+            var sequence = _resolveWorker!.Sequence;
+            if (!_commandThread!.TryReadShadowBefore(address, destination, sequence, out var shadowSequence, out var shadowSource))
+            {
+                return false;
+            }
+
+            if (_translation.PendingWrites is { } pending && pending.HasPendingBetween(address, (ulong)destination.Length, shadowSequence, sequence))
+            {
+                throw new SerialResolveRequiredException("shadowed pending write read");
+            }
+
+            if (_commandThread.HasPendingRangeBetween(address, (ulong)destination.Length, shadowSequence, sequence))
+            {
+                throw new SerialResolveRequiredException("shadowed pending range read");
+            }
+
+            AgcExports.NoteWorkerShadowRead((int)shadowSource);
+            return true;
+        }
+
+        private bool IsGpuOwnedForWorkerRead(ulong address, ulong size) => _bufferCache.HasGpuDirtyBytes(address, size);
+
+        private bool IsGpuOwnedForWorkerCleanRead(ulong address, ulong size) =>
+            (_bufferCache.MayHaveGpuDirtyPages(address, size) && _bufferCache.HasGpuDirtyPages(address, size)) || _bufferCache.HasGpuDirtyBytes(address, size);
+
+        private bool IsPendingForWorker(ulong address, ulong size)
+        {
+            var sequence = _resolveWorker!.Sequence;
+            return (_translation.PendingWrites is { } pending && pending.HasPendingBetween(address, size, pending.Released, sequence)) ||
+                _commandThread!.HasShadowBefore(address, size, sequence);
+        }
 
         // Items run in batches; completions are collected between them so blocked waits retry.
         private const int CommandItemBatch = 256;
@@ -214,7 +381,8 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (_commandThread is null)
             {
-                _commandThread = new CommandThread(_commandStream, _guestMemory, RunDeferredWork, _translation.Prefetch);
+                _commandThread = new CommandThread(this, _commandStream, _guestMemory, RunDeferredWork, RunCommandSlice);
+                _bufferCache.ObservationGated = true;
                 _betweenCommandItems = RunRelayBetweenCommandItems;
                 _translation.Sink = _commandThread;
                 _commandThread.Start();
@@ -231,32 +399,30 @@ internal static unsafe partial class VulkanVideoPresenter
                 int ran;
                 using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.CommandStream))
                 {
-                    var aliasAccess = _guestBacking?.TryEnterBackingAliasAccess() == true;
-                    _backingAliasAccess = aliasAccess;
-                    try
-                    {
-                        ran = thread.RunBatch(renderWorkDeadline, CommandItemBatch, _betweenCommandItems!);
-                    }
-                    finally
-                    {
-                        _backingAliasAccess = false;
-                        if (aliasAccess)
-                        {
-                            _guestBacking!.ExitBackingAliasAccess();
-                        }
-                    }
+                    ran = thread.RunBatch(renderWorkDeadline, CommandItemBatch, _betweenCommandItems!);
                 }
 
                 if (ran == 0 || System.Diagnostics.Stopwatch.GetTimestamp() >= renderWorkDeadline)
                 {
+                    _scheduler.SubmitDeferred();
                     return;
                 }
             }
         }
 
+        private SliceResult RunCommandSlice() => _commandStream.ProcessOne();
+
         private void RunDeferredWork(AgcExports.DeferredWork work)
         {
-            using var translationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandDrawTranslation);
+            if (work is AgcExports.GlobalBarrierWork)
+            {
+                EmitGlobalBarrier();
+                return;
+            }
+
+            using var translationScope = RenderPhaseProfile.MeasureDetail(work.IsDispatch
+                ? RenderPhaseProfile.Phase.CommandDispatchTranslation
+                : RenderPhaseProfile.Phase.CommandDrawTranslation);
             var started = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
@@ -268,56 +434,44 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        // Commands other threads post to the GPU worker run between items, with the resolution
-        // worker held: they change the caches it reads.
         private void RunRelayBetweenCommandItems()
         {
             if (_relay.HasPendingCommands)
             {
-                RunRelayCommandsWithPrefetchHeld();
-            }
-        }
-
-        private void RunRelayCommandsWithPrefetchHeld()
-        {
-            var prefetch = _commandThread is not null ? _translation.Prefetch : null;
-            prefetch?.Pause();
-            try
-            {
                 using var relayScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.QueueRelay);
                 _relay.RunPendingCommands();
             }
-            finally
-            {
-                prefetch?.Resume();
-            }
         }
 
-        // The interpreter's own stores (labels, atomics, semaphores) follow every deferred draw.
         private DrainingWriteMemory? _commandMemory;
 
-        ICpuMemory ICommandStreamHost.Memory => _commandMemory ??= new DrainingWriteMemory(_guestMemory, DrainDraws, this);
+        ICpuMemory ICommandStreamHost.Memory => _commandMemory ??= new DrainingWriteMemory(_guestMemory, this);
 
         // On the command stream thread a store is queued behind the work before it and reads see
-        // the queued stores; elsewhere the deferred draws run first.
-        private sealed class DrainingWriteMemory(ICpuMemory inner, Action drain, Presenter presenter) : ICpuMemory, ICpuMemoryWrapper
+        // the queued stores.
+        private sealed class DrainingWriteMemory(ICpuMemory inner, Presenter presenter) : ICpuMemory, ICpuMemoryWrapper
         {
             public ICpuMemory Inner => inner;
 
-            public bool TryRead(ulong virtualAddress, Span<byte> destination) =>
-                presenter.OnCommandThread
+            public bool TryRead(ulong virtualAddress, Span<byte> destination)
+            {
+                if (presenter.OnResolveWorker)
+                    return presenter.ReadOnResolveWorker(virtualAddress, destination);
+                if (presenter.HasPendingMemoryPublication(virtualAddress, (ulong)destination.Length))
+                    presenter.CompleteOverlappingPublications(virtualAddress, (ulong)destination.Length);
+                return presenter.OnCommandThread
                     ? presenter._commandThread!.ReadOverlay(virtualAddress, destination)
                     : inner.TryRead(virtualAddress, destination);
+            }
 
             public bool TryWrite(ulong virtualAddress, ReadOnlySpan<byte> source)
             {
+                presenter.CompleteOverlappingPublications(virtualAddress, (ulong)source.Length);
                 if (presenter.OnCommandThread)
                 {
                     presenter._commandThread!.PostWrite(virtualAddress, source);
                     return true;
                 }
-
-                drain();
                 return inner.TryWrite(virtualAddress, source);
             }
 
@@ -332,7 +486,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     return result;
                 }
 
-                drain();
+                presenter.CompleteOverlappingPublications(virtualAddress, (ulong)expected.Length);
                 return inner.TryCompare(virtualAddress, expected, out equal);
             }
 
@@ -343,7 +497,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     return presenter._commandThread!.Run(() => TryCopy(destinationAddress, sourceAddress, length));
                 }
 
-                drain();
+                presenter.CompleteOverlappingPublications(destinationAddress, length);
+                presenter.CompleteOverlappingPublications(sourceAddress, length);
                 return inner.TryCopy(destinationAddress, sourceAddress, length);
             }
 
@@ -355,41 +510,142 @@ internal static unsafe partial class VulkanVideoPresenter
             public string DescribeReadRange(ulong address, ulong size) => inner.DescribeReadRange(address, size);
         }
 
-        // A read the render thread runs after everything queued before it, for the command thread.
-        private bool ReadOnRenderThread(ulong address, Span<byte> destination, bool operand)
+        private static string ReadSite()
         {
+            foreach (var frame in new System.Diagnostics.StackTrace(2, false).GetFrames())
+            {
+                if (frame.GetMethod() is { DeclaringType: { } type } method &&
+                    type.Name.StartsWith(nameof(SharpEmu.Libs.Gpu.GpuCommands.GpuCommandInterpreter), StringComparison.Ordinal) &&
+                    method.Name is not ("ReadDword" or "ReadQword" or "ReadBytes" or "ReadWaitOperand"))
+                {
+                    return method.Name;
+                }
+            }
+
+            return "unknown";
+        }
+
+        // A read the render thread runs after everything queued before it, for the command thread.
+        private bool ReadOnRenderThread(ulong address, Span<byte> destination, bool operand, RenderReadSource source, bool publication)
+        {
+            var started = System.Diagnostics.Stopwatch.GetTimestamp();
             var buffer = new byte[destination.Length];
             var read = _commandThread!.Run(() => operand ? TryReadGuestOperand(address, buffer) : TryReadGuest(address, buffer));
             buffer.CopyTo(destination);
+            var elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - started;
+            Diagnostics.CommandThreadTally.NoteRoundTrip(elapsed);
+            RoundTripTotals.NoteRead((int)source * 2 + (publication ? 0 : 1), elapsed, address, ReadSite());
             return read;
         }
 
         // Command memory and polled labels: GPU-written pages go through the render thread, the
         // rest is read here with the stream's queued stores applied.
-        private bool ReadOnCommandThread(ulong address, Span<byte> destination)
+        private bool ReadOnCommandThread(ulong address, Span<byte> destination, RenderReadSource source = RenderReadSource.Memory)
         {
-            _commandThread!.WaitForPendingRange(address, (ulong)destination.Length);
-            return _bufferCache.MayHaveGpuDirtyPages(address, (ulong)destination.Length)
-                ? ReadOnRenderThread(address, destination, operand: false)
-                : _commandThread!.ReadOverlay(address, destination);
+            var size = (ulong)destination.Length;
+            if (HasPendingMemoryPublication(address, size))
+            {
+                return ReadOnRenderThread(address, destination, operand: false, source, publication: true);
+            }
+
+            if (IsCleanReadPage(address, size) && TryReadAliasBytes(address, destination))
+            {
+                RenderPhaseProfile.RecordCleanRead(hit: true);
+                return true;
+            }
+
+            RenderPhaseProfile.RecordCleanRead(hit: false);
+            var thread = _commandThread!;
+            if (thread.TryReadShadow(address, destination, out var shadowSequence, out var shadowSource) &&
+                !NewerPendingWrite(address, size, shadowSequence) && !thread.HasPendingRangeAfter(address, size, shadowSequence))
+            {
+                Diagnostics.CommandThreadTally.NoteShadowRead((int)shadowSource);
+                return true;
+            }
+
+            thread.WaitForPendingRange(address, size);
+            AwaitPendingGpuWrite(address, size);
+            if (_bufferCache.MayHaveGpuDirtyPages(address, size) && _bufferCache.HasGpuDirtyBytes(address, size))
+            {
+                return ReadOnRenderThread(address, destination, operand: false, source, publication: false);
+            }
+
+            if (!thread.ReadOverlay(address, destination))
+            {
+                return false;
+            }
+
+            NoteCleanReadPage(address, size);
+            return true;
         }
 
+        private void AwaitPendingGpuWrite(ulong address, ulong size)
+        {
+            if (_translation.PendingWrites is { } pending && pending.TryGetPending(address, size, out var sequence))
+            {
+                _commandThread!.WaitPending(sequence);
+            }
+        }
+
+        private bool NewerPendingWrite(ulong address, ulong size, long afterSequence) =>
+            _translation.PendingWrites is { } pending && pending.TryGetPending(address, size, out var sequence) && sequence > afterSequence;
+
+        private bool IsPendingOnCommandThread(ulong address, ulong size) =>
+            (_translation.PendingWrites is { } pending && pending.TryGetPending(address, size, out _)) || _commandThread!.HasShadow(address, size);
+
+        public bool HasGpuWrittenCommandData(ulong address, ulong size) =>
+            HasPendingMemoryPublication(address, size) ||
+            (_translation.PendingWrites is { } pending && pending.TryGetPending(address, size, out _)) ||
+            (OnCommandThread && (_commandThread!.HasShadow(address, size) || _commandThread.HasPendingRangeAfter(address, size, 0))) ||
+            (_bufferCache.MayHaveGpuDirtyPages(address, size) && _bufferCache.HasGpuDirtyBytes(address, size));
+
         public bool TryReadGuestWaitOperand(ulong address, Span<byte> destination) =>
-            OnCommandThread ? ReadOnCommandThread(address, destination) : TryReadGuestOperand(address, destination);
+            OnCommandThread ? ReadOnCommandThread(address, destination, RenderReadSource.Wait) : TryReadGuestOperand(address, destination);
+
+        internal static readonly bool ReadbacksOff =
+            string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_GPU_READBACKS"), "off", StringComparison.OrdinalIgnoreCase);
+
+        public bool TryReadGuestWaitOperand(ulong address, Span<byte> destination, bool allowStale, out bool stale)
+        {
+            stale = false;
+            if (allowStale && ReadbacksOff && OnCommandThread && TryReadStaleOnCommandThread(address, destination))
+            {
+                stale = true;
+                return true;
+            }
+
+            return TryReadGuestWaitOperand(address, destination);
+        }
+
+        private bool TryReadStaleOnCommandThread(ulong address, Span<byte> destination)
+        {
+            var size = (ulong)destination.Length;
+            var needsRenderThread = HasPendingMemoryPublication(address, size) ||
+                _bufferCache.MayHaveGpuDirtyPages(address, size) && _bufferCache.HasGpuDirtyBytes(address, size);
+            return needsRenderThread && _commandThread!.ReadOverlay(address, destination);
+        }
 
         public bool TryReadGuestOperand(ulong address, Span<byte> destination)
         {
-            if (OnCommandThread)
+            if (OnResolveWorker)
             {
-                return ReadOnRenderThread(address, destination, operand: true);
+                return ReadOnResolveWorker(address, destination);
             }
 
-            DrainDraws();
+            if (OnCommandThread)
+            {
+                return ReadOnCommandThread(address, destination, RenderReadSource.Operand);
+            }
             return TryReadGuest(address, destination);
         }
 
         public bool TryReadGuest(ulong address, Span<byte> destination)
         {
+            if (OnResolveWorker)
+            {
+                return ReadOnResolveWorker(address, destination);
+            }
+
             if (OnCommandThread)
             {
                 return ReadOnCommandThread(address, destination);
@@ -397,12 +653,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandMemorySync))
             {
-                // GPU-written command memory is downloaded first: deferred draws are recorded before it.
-                if (_translation is { HasPendingDraws: true } && _bufferCache.MayHaveGpuDirtyPages(address, (ulong)destination.Length))
-                {
-                    DrainDraws();
-                }
-
+                if (HasPendingMemoryPublication(address, (ulong)destination.Length))
+                    CompleteOverlappingPublications(address, (ulong)destination.Length);
                 if (!_bufferCache.TrySynchronizeCpuRead(address, (ulong)destination.Length,
                     SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.CommandMemoryRead))
                 {
@@ -417,14 +669,9 @@ internal static unsafe partial class VulkanVideoPresenter
         public void RunPendingCommands()
         {
             // With the stream on its own thread the render thread runs them between its items.
-            if (OnCommandThread)
+            if (OnCommandThread || !_relay.HasPendingCommands)
             {
                 return;
-            }
-
-            if (_relay.HasPendingCommands)
-            {
-                DrainDraws();
             }
 
             using var relayScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.QueueRelay);
@@ -440,14 +687,16 @@ internal static unsafe partial class VulkanVideoPresenter
                 _commandThread!.Post(() => BeginSubmissionContext(queueId, submissionId));
                 return;
             }
-
-            DrainDraws();
             BeginSubmissionContext(queueId, submissionId);
             _translation.BeginSubmission(queueId, submissionId, geometrySnapshots, _commandStream.GetInterpreter(queueId));
         }
 
         private void BeginSubmissionContext(int queueId, ulong submissionId)
         {
+            if (_occlusionQueueId != queueId)
+                _recording?.EndRendering();
+            _occlusionQueueId = queueId;
+            _imageCache.SetMetadataTraceSubmission(queueId, submissionId);
             using var contextScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.QueueContext);
             _activeGuestQueue = new VulkanGuestQueueIdentity(_commandQueueNames[queueId], submissionId);
             BindSubmissionContext(_activeGuestQueue);
@@ -461,8 +710,6 @@ internal static unsafe partial class VulkanVideoPresenter
                 _commandThread!.Post(Flush);
                 return;
             }
-
-            DrainDraws();
             using var flushScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.Flush);
             FlushBatchedGuestCommands();
         }
@@ -471,13 +718,22 @@ internal static unsafe partial class VulkanVideoPresenter
         // so the draws queued before it are recorded first.
         public void FlushFrame()
         {
+            BufferUploadProfile.NoteGuestFrameLead(++_framesEnded - _bufferCache.FrameTicks.CompletedFrame(_scheduler.CompletedTick));
             if (OnCommandThread)
             {
-                _commandThread!.Run(Flush);
+                _commandThread!.Post(EndFrame);
                 return;
             }
 
+            EndFrame();
+        }
+
+        private long _framesEnded;
+
+        private void EndFrame()
+        {
             Flush();
+            _bufferCache.FrameTicks.NoteFrameSubmitted(_scheduler.CurrentTick - 1);
         }
 
         public void FlushAndWait()
@@ -487,8 +743,6 @@ internal static unsafe partial class VulkanVideoPresenter
                 _commandThread!.Run(FlushAndWait);
                 return;
             }
-
-            DrainDraws();
             using var waitScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandGpuWait);
             _ = CurrentRecordingBuffer();
             _scheduler.FlushAndWait();
@@ -502,8 +756,6 @@ internal static unsafe partial class VulkanVideoPresenter
                 _commandThread!.Run(SynchronizeGpu);
                 return;
             }
-
-            DrainDraws();
             using var waitScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandGpuWait);
             _ = CurrentRecordingBuffer();
             _scheduler.Finish();
@@ -517,8 +769,6 @@ internal static unsafe partial class VulkanVideoPresenter
                 _commandThread!.Post(RunGarbageCollector);
                 return;
             }
-
-            DrainDraws();
             RunGuestCacheCollection(endsFrame: false);
         }
 
@@ -526,31 +776,29 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (OnCommandThread)
             {
-                _commandThread!.Post(EmitGlobalBarrier);
+                _commandThread!.EnqueueDeferred(AgcExports.GlobalBarrierWork.Instance, isDraw: false);
                 return;
             }
-
-            DrainDraws();
             // Inside a rendering scope whose draws only wrote attachments, the barrier matters only
             // to what runs after the scope: everything before the scope is ordered by the barrier
             // BeginRendering records, and a draw that stores to memory ends a deferred scope first.
-            if (DeferGlobalBarriers && _renderingActive && !_renderingWritesMemory)
+            if (RecordingHost.DeferGlobalBarriers && Recording._renderingActive && !Recording._renderingWritesMemory)
             {
-                _globalBarrierAfterRendering = true;
+                Recording._globalBarrierAfterRendering = true;
                 return;
             }
 
-            EndRendering();
-            if (BatchBarriers)
+            Recording.EndRendering(ScopeBreak.GuestFlush);
+            if (RecordingHost.BatchBarriers)
             {
-                RequestGuestMemoryBarrier(GlobalMemoryBarrier);
+                RequestGuestMemoryBarrier(RecordingHost.GlobalMemoryBarrier);
                 return;
             }
 
             RecordGlobalBarrier(BeginBatchedGuestCommands());
         }
 
-        private void RecordGlobalBarrier(CommandBuffer commandBuffer)
+        internal void RecordGlobalBarrier(CommandBuffer commandBuffer)
         {
             var barrier = new MemoryBarrier2
             {
@@ -568,22 +816,28 @@ internal static unsafe partial class VulkanVideoPresenter
                 0,
                 null,
                 0,
-                null);
+                null, BarrierSource.Global);
         }
 
         public void FillBuffer(ulong address, ulong size, uint value, bool isGds)
         {
             if (OnCommandThread)
             {
-                _commandThread!.PostRange(() => FillBuffer(address, size, value, isGds), address, isGds ? 0 : size);
+                var sequence = _commandThread!.PostRange(() => FillBuffer(address, size, value, isGds), address, isGds ? 0 : size, CommandThread.RangeKind.Fill);
+                if (!isGds && size != 0 && size <= CommandThread.SmallTransferBytes && ((address | size) & 3) == 0)
+                {
+                    var words = new uint[size / sizeof(uint)];
+                    Array.Fill(words, value);
+                    _commandThread.NoteKnownWrite(new SharpEmu.Libs.Gpu.Rendering.KnownGpuWrite(address, words, words.Length), sequence, CommandThread.ShadowSource.Fill);
+                    Diagnostics.CommandThreadTally.NoteSmallTransfer(copy: false);
+                }
+
                 return;
             }
-
-            DrainDraws();
             using var transferScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandMemoryTransfer);
             // Transfers the buffer cache completes in guest memory leave the rendering scope open;
             // its GPU paths end the scope before they record.
-            _ = BeginBatchedGuestCommands();
+            EnsureBatchedGuestCommands();
             _bufferCache.FillBuffer(address, size, value, isGds);
         }
 
@@ -591,16 +845,50 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (OnCommandThread)
             {
-                _commandThread!.PostRange(() => CopyBuffer(destination, source, size, destinationIsGds, sourceIsGds), destination, destinationIsGds ? 0 : size);
+                uint[]? words = null;
+                if (!destinationIsGds && !sourceIsGds && size != 0 && size <= CommandThread.SmallTransferBytes && ((destination | size) & 3) == 0)
+                {
+                    var settled = new uint[size / sizeof(uint)];
+                    if (TryReadSettledSource(source, System.Runtime.InteropServices.MemoryMarshal.AsBytes(settled.AsSpan())))
+                    {
+                        words = settled;
+                    }
+                }
+
+                var sequence = _commandThread!.PostRange(() => CopyBuffer(destination, source, size, destinationIsGds, sourceIsGds), destination, destinationIsGds ? 0 : size, CommandThread.RangeKind.Copy);
+                if (words is not null)
+                {
+                    _commandThread.NoteKnownWrite(new SharpEmu.Libs.Gpu.Rendering.KnownGpuWrite(destination, words, words.Length), sequence, CommandThread.ShadowSource.Copy);
+                    Diagnostics.CommandThreadTally.NoteSmallTransfer(copy: true);
+                }
+
                 return;
             }
-
-            DrainDraws();
             using var transferScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandMemoryTransfer);
             // Transfers the buffer cache completes in guest memory leave the rendering scope open;
             // its GPU paths end the scope before they record.
-            _ = BeginBatchedGuestCommands();
+            EnsureBatchedGuestCommands();
             _bufferCache.CopyBuffer(destination, source, size, destinationIsGds, sourceIsGds);
+        }
+
+        public void TraceGuestWrite(string operation, ulong address, ulong size) =>
+            _imageCache.TraceGuestWrite(operation, address, size);
+
+        public void TraceWritersOf(string subject, ulong address, ulong size) =>
+            _imageCache.TraceWritersOf(subject, address, size);
+
+        public void TraceDrawTarget(string disposition, ulong address, ulong pixelShaderAddress, ulong vertexShaderAddress) =>
+            _imageCache.TraceGuestWrite($"draw-target-{disposition}", address, 1, pixelShaderAddress, vertexShaderAddress);
+
+        private bool TryReadSettledSource(ulong source, Span<byte> destination)
+        {
+            var size = (ulong)destination.Length;
+            if (_commandThread!.HasPendingRange(source, size) || HasPendingMemoryPublication(source, size) || !IsCleanReadPage(source, size))
+            {
+                return false;
+            }
+
+            return TryReadAliasBytes(source, destination);
         }
 
         public void ReadGds(Span<uint> destination, uint wordOffset, uint wordCount)
@@ -612,8 +900,6 @@ internal static unsafe partial class VulkanVideoPresenter
                 words.CopyTo(destination);
                 return;
             }
-
-            DrainDraws();
             EndOfPipe.ReadGdsWords(_bufferCache.GdsBuffer.Mapped, destination, wordOffset, wordCount);
         }
 
@@ -625,10 +911,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 _commandThread!.Post(() => RecordEndOfPipe(in queued));
                 return;
             }
-
-            DrainDraws();
             using var completionScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandEndOfPipe);
-            _ = BeginBatchedGuestCommands();
+            EnsureBatchedGuestCommands();
             var buffer = _scheduler.Current;
             switch (write.Kind)
             {
@@ -689,47 +973,47 @@ internal static unsafe partial class VulkanVideoPresenter
                 _commandThread!.Post(() => TriggerInterrupt(eventId, contextId));
                 return;
             }
-
-            DrainDraws();
             _endOfPipeEvents.TriggerInterrupt(eventId, contextId);
         }
 
         public bool HasFlipSlot()
         {
-            if (OnCommandThread)
-            {
-                return _commandThread!.Run(HasFlipSlot);
-            }
-
-            DrainDraws();
             lock (_gate)
             {
                 return _pendingGuestImagePresentations.Count < MaxPendingGuestFlipVersions;
             }
         }
 
-        public ulong PrepareFlip(int handle, int index, int flipMode, long flipArgument)
+        public ulong PrepareFlip(int handle, int index, int flipMode, long flipArgument) =>
+            PrepareFlip(0, handle, index, flipMode, flipArgument);
+
+        public ulong PrepareFlip(int queueId, int handle, int index, int flipMode, long flipArgument)
         {
             if (OnCommandThread)
             {
-                return _commandThread!.Run(() => PrepareFlip(handle, index, flipMode, flipArgument));
+                return _commandThread!.Run(() => PrepareFlip(queueId, handle, index, flipMode, flipArgument));
             }
-
-            DrainDraws();
-            _ = BeginBatchedGuestCommands();
-            return _endOfPipe.PrepareVideoOutFlip(_scheduler.Current, handle, index, flipMode, flipArgument);
-        }
-
-        public bool IsFlipDone(int handle, int index)
-        {
-            if (OnCommandThread)
+            EnsureBatchedGuestCommands();
+            var publication = _guestPublications.LastRecorded(queueId) is null
+                ? null : _guestPublications.AddAfterPending(queueId, 0, 0);
+            if (publication is not null) _guestPublications.Register(publication, _scheduler.CurrentTick);
+            _capturePublication = publication;
+            try
             {
-                return _commandThread!.Run(() => IsFlipDone(handle, index));
+                var request = _endOfPipe.PrepareVideoOutFlip(_scheduler.Current, handle, index, flipMode, flipArgument);
+                if (publication is not null && !(_flipPublications ??= new()).TryAdd(request, publication))
+                    throw SubmissionScheduler.Fatal("The flip publication is already registered.");
+                return request;
             }
-
-            DrainDraws();
-            return VideoOutExports.IsFlipDone(handle, index);
+            catch (Exception exception)
+            {
+                FailGuestPublications(exception);
+                throw;
+            }
+            finally { _capturePublication = null; }
         }
+
+        public bool IsFlipDone(int handle, int index) => VideoOutExports.IsFlipDone(handle, index);
 
         public void PrepareCpuFlip(int handle, int index, ulong requestId)
         {
@@ -738,8 +1022,6 @@ internal static unsafe partial class VulkanVideoPresenter
                 _commandThread!.Run(() => PrepareCpuFlip(handle, index, requestId));
                 return;
             }
-
-            DrainDraws();
             CaptureFlip(handle, index, requestId, flipMode: 0, flipArg: 0);
         }
 
@@ -804,8 +1086,6 @@ internal static unsafe partial class VulkanVideoPresenter
                 _translation.Dispatch(submitId, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress);
                 return;
             }
-
-            DrainDraws();
             using var translationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandDispatchTranslation);
             var started = System.Diagnostics.Stopwatch.GetTimestamp();
             try
@@ -825,33 +1105,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 _translation.QueueReset(queueId);
                 return;
             }
-
-            DrainDraws();
             _translation.QueueReset(queueId);
-        }
-
-        // Deferred draws run before anything else the stream asks of the host: everything but a
-        // draw may record, read or write what they use. Their time counts as draw time. Completion
-        // callbacks reach some of the same entry points from the GPU priority worker; they are not
-        // ordered with the stream and leave the draws to the render thread.
-        private void DrainDraws()
-        {
-            // Hosts built without a command stream have no translation.
-            if (_translation is not { HasPendingDraws: true } || !_relay.IsGpuQueueThread)
-            {
-                return;
-            }
-
-            using var translationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandDrawTranslation);
-            var started = System.Diagnostics.Stopwatch.GetTimestamp();
-            try
-            {
-                _translation.DrainPendingDraws();
-            }
-            finally
-            {
-                Interlocked.Add(ref _perfDrawTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started);
-            }
         }
 
         public Exception Fatal(string message) => SubmissionScheduler.Fatal(message);
@@ -859,7 +1113,6 @@ internal static unsafe partial class VulkanVideoPresenter
         // The flip packet: translation first, then the request, then the capture in stream order.
         public int SubmitFlipFromGpu(RecordingBuffer buffer, int handle, int index, int flipMode, long flipArg, out ulong requestId)
         {
-            DrainDraws();
             _ = buffer;
             _translation.PrepareFlip(handle, index);
             var result = VideoOutExports.TryReserveFlipRequest(handle, index, flipMode, flipArg, gpuQueued: true, out requestId);
@@ -885,17 +1138,19 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void CompleteFlip(ulong requestId)
         {
-            DrainDraws();
             VideoOutExports.CompleteFlip(requestId);
         }
 
         // Copies the display surface through the store; presentation shows the copy once its tick retires.
         internal void CaptureFlip(int handle, int index, ulong requestId, int flipMode, long flipArg)
         {
-            DrainDraws();
+            var publication = _capturePublication ?? _guestPublications.LastRecorded(0);
             // A no-buffer flip has no image to capture; its completion still retires in order.
-            if (VideoOutExports.ReleaseNoBufferFlip(index, requestId))
+            if (index == -1)
             {
+                if (_capturePublication is not null) return;
+                if (publication is null) VideoOutExports.ReleaseNoBufferFlip(index, requestId);
+                else _scheduler.QueueMemoryPublication(() => VideoOutExports.ReleaseNoBufferFlip(index, requestId), publication.Tick);
                 return;
             }
             if (!VideoOutExports.TryGetDisplayBufferInfo(handle, index, out var displayBuffer))
@@ -925,7 +1180,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 var surface = new DisplaySurfaceWords(
                     displayBuffer.Address, 0, displayBuffer.PixelFormat, displayBuffer.Width, displayBuffer.Height, displayBuffer.TilingMode, displayBuffer.Option, 0, 0, false);
                 var request = ImageRequestBuilders.DisplaySurface(surface);
-                _ = BeginBatchedGuestCommands();
+                EnsureBatchedGuestCommands();
                 var imageIdentifier = _imageCache.FindImage(ref request);
                 var source = _imageCache.GetImage(imageIdentifier);
                 source.Uses.VideoOut = true;
@@ -935,7 +1190,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 var extent = source.Backing.Extent;
                 snapshot = CreateGuestFlipSnapshot(GetPresentationSnapshotFormat(source.Backing.Format),
                     extent.Width, extent.Height, displayBuffer.Address, version);
-                source.Transition(ImageLayout.TransferSrcOptimal, AccessFlags.TransferReadBit, null, commandBuffer);
+                source.Transition(AccessFlags.TransferReadBit, null, commandBuffer);
                 var toTransferDst = new ImageMemoryBarrier2
                 {
                     SType = StructureType.ImageMemoryBarrier2,
@@ -956,8 +1211,11 @@ internal static unsafe partial class VulkanVideoPresenter
                     DstSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
                     Extent = new Extent3D(extent.Width, extent.Height, 1),
                 };
-                _vk.CmdCopyImage(
-                    commandBuffer, source.Backing.Handle, ImageLayout.TransferSrcOptimal, snapshot.Image, ImageLayout.TransferDstOptimal, 1, &copy);
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                {
+                    _vk.CmdCopyImage(
+                        commandBuffer, source.Backing.Handle, ImageLayout.General, snapshot.Image, ImageLayout.TransferDstOptimal, 1, &copy);
+                }
                 var toShaderRead = new ImageMemoryBarrier2
                 {
                     SType = StructureType.ImageMemoryBarrier2,
@@ -994,7 +1252,8 @@ internal static unsafe partial class VulkanVideoPresenter
                         GuestImageVersion: version,
                         IsHdr: VideoOutExports.IsHdrPixelFormat(displayBuffer.PixelFormat),
                         RequiredTick: captureTick,
-                        FlipRequestId: requestId);
+                        FlipRequestId: requestId,
+                        Publication: publication);
                     _latestPresentation = presentation;
                     _pendingGuestImagePresentations.Enqueue(presentation);
                     while (_pendingGuestImagePresentations.Count > MaxPendingGuestFlipVersions)
@@ -1009,6 +1268,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     $"queue={_activeGuestQueue.Name} submission={_activeGuestQueue.SubmissionId} " +
                     $"request={requestId} addr=0x{displayBuffer.Address:X16} " +
                     $"size={extent.Width}x{extent.Height}");
+                IndexedDrawTrace.OnFlip(version);
+                VisibilityResultTrace.OnFlip(version);
                 RenderDocCapture.OnGuestFlipBoundary(version);
                 VideoOutExports.TraceGpuFlip(_guestMemory, handle, index, flipMode, flipArg, displayBuffer.Address, VideoOutExports.GetFlipEventCount(requestId));
             }
@@ -1057,6 +1318,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         // Keep GPU completion separate from refresh eligibility.
         private bool IsPresentationReadyLocked(in Presentation presentation) =>
+            (presentation.Publication is null || presentation.Publication.Completed) &&
             (presentation.RequiredTick == 0 || (_scheduler is not null && _scheduler.Timeline.CompletedTick >= presentation.RequiredTick)) &&
             VideoOutExports.CanPresentFlip(presentation.FlipRequestId, System.Diagnostics.Stopwatch.GetTimestamp());
 
@@ -1085,6 +1347,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     {
                         presentation = _pendingGuestImagePresentations.Dequeue();
                         TryReplaceWithHostMovieFrame(ref presentation);
+                        TryReplaceWithHeldSplash(ref presentation);
                         return true;
                     }
 
@@ -1125,6 +1388,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
                 presentation = latest;
                 TryReplaceWithHostMovieFrame(ref presentation);
+                TryReplaceWithHeldSplash(ref presentation);
                 return true;
             }
         }

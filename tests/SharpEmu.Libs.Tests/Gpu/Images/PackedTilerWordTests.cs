@@ -79,50 +79,6 @@ public sealed class PackedTilerWordTests(HeadlessVulkanFixture fixture) : IClass
     }
 
     [Fact]
-    public void PackedWordsStayContiguousAcrossEveryEligibleBlockLayout()
-    {
-        foreach (var kind in Enum.GetValues<TileBlockKind>())
-            foreach (var bytes in new[] { 1u, 2u })
-            {
-                if (kind == TileBlockKind.Depth64KB && bytes == 1) continue;
-                Assert.True(TileGeometry.TryGetBlockLayout(kind, bytes, out var block));
-                for (uint z = 0; z < block.BlockDepth; z++)
-                    for (uint y = 0; y < block.BlockHeight; y++)
-                        for (uint x = 0; x < block.BlockWidth; x += 4 / bytes)
-                        {
-                            Assert.True(TileGeometry.TryGetBlockOffset(block, x, y, z, out var first));
-                            Assert.Equal(0u, first & 3);
-                            for (uint lane = 1; lane < 4 / bytes; lane++)
-                            {
-                                Assert.True(TileGeometry.TryGetBlockOffset(block, x + lane, y, z, out var offset));
-                                Assert.Equal(first + lane * bytes, offset);
-                            }
-                        }
-            }
-    }
-
-    [Fact]
-    public void PackedTiledWorkgroupsCoverOneContiguousSector()
-    {
-        foreach (var kind in Enum.GetValues<TileBlockKind>())
-            foreach (var bytes in new[] { 1u, 2u })
-            {
-                if (kind == TileBlockKind.Depth64KB && bytes == 1) continue;
-                Assert.True(TileGeometry.TryGetBlockLayout(kind, bytes, out var block));
-                var local = TilerShaders.BlockCopyWorkgroupSize((TilerBlockShape)kind, bytes, true, true);
-                var addresses = new List<uint>();
-                for (uint z = 0; z < local.Z; z++)
-                    for (uint y = 0; y < local.Y; y++)
-                        for (uint x = 0; x < local.X; x += 4 / bytes)
-                        {
-                            Assert.True(TileGeometry.TryGetBlockOffset(block, x, y, z, out var offset));
-                            addresses.Add(offset);
-                        }
-                Assert.Equal(Enumerable.Range(0, 8).Select(i => (uint)i * 4), addresses.Order());
-            }
-    }
-
-    [Fact]
     public void PackedDispatchRejectsTheActualWorkgroupCountBeforeBinding()
     {
         var gpu = fixture.Vulkan;
@@ -235,7 +191,7 @@ public sealed class PackedTilerWordTests(HeadlessVulkanFixture fixture) : IClass
                     count += 2;
                 }
             }
-        Assert.Equal(348, count);
+        Assert.Equal(384, count); // Original 348 plus 36 GCN transfers.
         Console.WriteLine($"Production tiler cases checked against CPU byte oracle: {count}");
         harness.AssertNoValidationMessages();
     }
@@ -254,13 +210,15 @@ public sealed class PackedTilerWordTests(HeadlessVulkanFixture fixture) : IClass
                 {
                     Assert.True(TileGeometry.TryGetBlockLayout(kind, bytes, out var block));
                     var pipeline = runner.CreatePipeline(TilerShaders.CreateBlockCopy((TilerBlockShape)kind, bytes, toTiled), []);
-                    var eligible = !(kind == TileBlockKind.Depth64KB && bytes == 1);
+                    var eligible = TilerShaders.SupportsPackedWords((TilerBlockShape)kind, bytes);
                     var packedPipeline = eligible ? runner.CreatePipeline(TilerShaders.CreateBlockCopy((TilerBlockShape)kind, bytes, toTiled, true), []) : pipeline;
                     for (var variant = 0; variant < 7; variant++)
                     {
                         var tail = variant is 3 or 4 or 6;
                         if (tail && kind == TileBlockKind.Standard256B) continue;
                         var width = variant == 5 ? 8u / bytes : variant == 6 ? 4u / bytes : tail ? (bytes == 1 ? 5u : 3u) : (bytes == 1 ? 13u : 7u);
+                        // GCN microtiles are only eight elements wide; keep the new tails inside one block.
+                        if (tail) width = Math.Min(width, block.BlockWidth - 4u / bytes);
                         var height = tail ? 3u : 9u;
                         var depth = block.BlockDepth == 1 ? 1u : 2u;
                         var pitch = variant == 2 ? width + 2 : ((width * bytes + 7) & ~3u) / bytes;
@@ -323,8 +281,74 @@ public sealed class PackedTilerWordTests(HeadlessVulkanFixture fixture) : IClass
                         count++;
                     }
                 }
-        Assert.Equal(268, count);
+        Assert.Equal(296, count); // Original 268 plus 28 GCN transfers.
         Console.WriteLine($"Packed tiler cases checked against CPU byte oracle: {count}");
         harness.AssertNoValidationMessages();
+    }
+}
+
+// Geometry checks do not create a Vulkan fixture and can run without a GPU.
+public sealed class PackedTilerGeometryTests
+{
+    [Fact]
+    public void PackedWordsStayContiguousAcrossEveryEligibleBlockLayout()
+    {
+        var layouts = 0;
+        foreach (var kind in Enum.GetValues<TileBlockKind>())
+            foreach (var bytes in new[] { 1u, 2u })
+            {
+                if (!TilerShaders.SupportsPackedWords((TilerBlockShape)kind, bytes)) continue;
+                layouts++;
+                Assert.True(TileGeometry.TryGetBlockLayout(kind, bytes, out var block));
+                for (uint z = 0; z < block.BlockDepth; z++)
+                    for (uint y = 0; y < block.BlockHeight; y++)
+                        for (uint x = 0; x < block.BlockWidth; x += 4 / bytes)
+                        {
+                            Assert.True(TileGeometry.TryGetBlockOffset(block, x, y, z, out var first));
+                            Assert.Equal(0u, first & 3);
+                            for (uint lane = 1; lane < 4 / bytes; lane++)
+                            {
+                                Assert.True(TileGeometry.TryGetBlockOffset(block, x + lane, y, z, out var offset));
+                                Assert.Equal(first + lane * bytes, offset);
+                            }
+                        }
+            }
+        Assert.Equal(20, layouts); // All original 19 eligible layouts plus GCN16.
+    }
+
+    [Fact]
+    public void PackedTiledWorkgroupsCoverOneContiguousSector()
+    {
+        foreach (var kind in Enum.GetValues<TileBlockKind>())
+            foreach (var bytes in new[] { 1u, 2u })
+            {
+                if (!TilerShaders.SupportsPackedWords((TilerBlockShape)kind, bytes)) continue;
+                Assert.True(TileGeometry.TryGetBlockLayout(kind, bytes, out var block));
+                var local = TilerShaders.BlockCopyWorkgroupSize((TilerBlockShape)kind, bytes, true, true);
+                var addresses = new List<uint>();
+                for (uint z = 0; z < local.Z; z++)
+                    for (uint y = 0; y < local.Y; y++)
+                        for (uint x = 0; x < local.X; x += 4 / bytes)
+                        {
+                            Assert.True(TileGeometry.TryGetBlockOffset(block, x, y, z, out var offset));
+                            addresses.Add(offset);
+                        }
+                Assert.Equal(Enumerable.Range(0, 8).Select(i => (uint)i * 4), addresses.Order());
+            }
+    }
+
+    [Fact]
+    public void GcnEightBitWordsInterleaveRowsAndMustUseFallback()
+    {
+        Assert.True(TileGeometry.TryGetBlockLayout(TileBlockKind.GcnThin1D, 1, out var block));
+        var offsets = new List<uint>();
+        for (uint x = 0; x < 4; x++)
+        {
+            Assert.True(TileGeometry.TryGetBlockOffset(block, x, 0, 0, out var offset));
+            offsets.Add(offset);
+        }
+        Assert.Equal(new uint[] { 0, 1, 4, 5 }, offsets);
+        Assert.False(TilerShaders.SupportsPackedWords(TilerBlockShape.GcnThin1D, 1));
+        Assert.True(TilerShaders.SupportsPackedWords(TilerBlockShape.GcnThin1D, 2));
     }
 }

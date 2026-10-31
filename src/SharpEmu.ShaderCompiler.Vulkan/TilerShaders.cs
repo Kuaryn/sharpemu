@@ -16,6 +16,7 @@ public enum TilerBlockShape
     RenderTarget64KB,
     Depth64KB,
     RenderTarget64KBGen5,
+    GcnThin1D,
 }
 
 // Assembles the tiler compute shaders: block copies per shape and element size,
@@ -210,9 +211,7 @@ public static class TilerShaders
 
     private static AddressBit[] BXY(byte x, byte y) => [BX(x), BY(y)];
 
-    // PS5 Oberon RB+ R_X addressing. The destination bit index is the array
-    // index. Keep this in lockstep with GnmTiling.RbPlus64KRenderX and
-    // TileGeometry.RenderTargetOffset.
+    // Keep the RB+ address bits consistent with the CPU tile layout.
     private static readonly AddressBit[][][] RenderTargetAddressBits =
     [
         [
@@ -327,8 +326,19 @@ public static class TilerShaders
         TilerBlockShape.Standard64KB or TilerBlockShape.Prt64KB or TilerBlockShape.RenderTarget64KB or TilerBlockShape.RenderTarget64KBGen5 => (ThinExtent(65536, bytes, 256, 128, 64), 65536),
         TilerBlockShape.Standard64KB3D or TilerBlockShape.Prt64KB3D => (Thick64KBExtent(bytes), 65536),
         TilerBlockShape.Depth64KB => (ThinExtent(65536, bytes, 256, 128, 128), 65536),
+        TilerBlockShape.GcnThin1D => ((8, 8, 1), 64 * bytes),
         _ => throw new ArgumentOutOfRangeException(nameof(shape)),
     };
+
+    private static Term[] GcnThin1DTerms(uint bytes)
+    {
+        var b = (int)Log2(bytes);
+        return
+        [
+            X(b, 1u << b), Y(b + 1, 1u << (b + 1)), X(b + 1, 1u << (b + 2)),
+            Y(b + 2, 1u << (b + 3)), X(b + 2, 1u << (b + 4)), Y(b + 3, 1u << (b + 5)),
+        ];
+    }
 
     private static uint BlockOffset(ShaderModuleContext shaderModule, TilerBlockShape shape, uint bytes, uint x, uint y, uint z)
     {
@@ -362,6 +372,8 @@ public static class TilerShaders
                 return shaderModule.Xor(XorTerms(shaderModule, x, y, z, Gen5RenderTargetTerms(bytes)), ZSpread(shaderModule, z));
             case TilerBlockShape.Depth64KB:
                 return shaderModule.Xor(ZSpread(shaderModule, z), XorTerms(shaderModule, x, y, z, DepthTerms(bytes)));
+            case TilerBlockShape.GcnThin1D:
+                return XorTerms(shaderModule, x, y, z, GcnThin1DTerms(bytes));
             default:
                 throw new ArgumentOutOfRangeException(nameof(shape));
         }
@@ -391,17 +403,23 @@ public static class TilerShaders
         shaderModule.Builder.AddInstruction(SpirvOp.AtomicOr, shaderModule.UintType, target, shaderModule.GetUnsignedConstant(1), shaderModule.GetUnsignedConstant(0), shaderModule.Builder.AddInstruction(SpirvOp.ShiftLeftLogical, shaderModule.UintType, value2, shift));
     }
 
-    // Create one module for each block shape, element size and transfer direction.
+    // Depth8 and GCN8 interleave Y before a whole X word has been assembled.
+    public static bool SupportsPackedWords(TilerBlockShape shape, uint elementBytes) =>
+        elementBytes is 1 or 2 && !(elementBytes == 1 && shape is TilerBlockShape.Depth64KB or TilerBlockShape.GcnThin1D);
+
     public static (uint X, uint Y, uint Z) BlockCopyWorkgroupSize(TilerBlockShape shape, uint elementBytes, bool toTiled, bool packedWords)
     {
         if (!packedWords) return (8, 8, 1);
+        if (!SupportsPackedWords(shape, elementBytes))
+            throw new ArgumentException("This layout does not have contiguous packed X words.", nameof(packedWords));
+
         // Active lanes cover one contiguous 32-byte output sector. Volume tiles
         // put Z0,Y0,Z1 just after packed X; linear output instead stays on one row.
         if (!toTiled) return (32u / elementBytes, 1, 1);
         if (shape is TilerBlockShape.Standard4KB3D or TilerBlockShape.Standard64KB3D or TilerBlockShape.Prt64KB3D)
             return (4u / elementBytes, 2, 4);
         if (shape == TilerBlockShape.RenderTarget64KBGen5 && elementBytes == 1) return (8, 4, 1);
-        if (shape == TilerBlockShape.Depth64KB && elementBytes == 2) return (4, 4, 1);
+        if (shape is TilerBlockShape.Depth64KB or TilerBlockShape.GcnThin1D) return (4, 4, 1);
         return (16u / elementBytes, 2, 1);
     }
 
@@ -412,7 +430,7 @@ public static class TilerShaders
         {
             throw new ArgumentOutOfRangeException(nameof(elementBytes));
         }
-        if (packedWords && (elementBytes >= 4 || (shape == TilerBlockShape.Depth64KB && elementBytes == 1)))
+        if (packedWords && !SupportsPackedWords(shape, elementBytes))
             throw new ArgumentException("This layout does not have contiguous packed X words.", nameof(packedWords));
 
         var shaderModule = new ShaderModuleContext(pushConstants: false);
@@ -435,8 +453,6 @@ public static class TilerShaders
         shaderModule.ReturnWhen(outside);
 
         var tail = builder.AddInstruction(SpirvOp.INotEqual, shaderModule.BooleanType, shaderModule.LoadArgument(12), shaderModule.GetUnsignedConstant(0));
-        var sourceBase = shaderModule.LoadArgument(0);
-        var destinationBase = shaderModule.LoadArgument(1);
         if (packedWords)
         {
             var follower = builder.AddInstruction(SpirvOp.INotEqual, shaderModule.BooleanType,
@@ -452,6 +468,8 @@ public static class TilerShaders
         var offset = BlockOffset(shaderModule, shape, elementBytes, swizzleX, swizzleY, shaderModule.Add(pz, shaderModule.LoadArgument(5)));
         var tiled = shaderModule.Add(shaderModule.Multiply(blockIndex, shaderModule.GetUnsignedConstant(blockBytes)), offset);
         var linear = shaderModule.Add(shaderModule.Add(shaderModule.Multiply(pz, shaderModule.LoadArgument(7)), shaderModule.Multiply(py, shaderModule.LoadArgument(6))), shaderModule.Multiply(px, shaderModule.GetUnsignedConstant(elementBytes)));
+        var sourceBase = shaderModule.LoadArgument(0);
+        var destinationBase = shaderModule.LoadArgument(1);
         var source = shaderModule.Add(sourceBase, toTiled ? linear : tiled);
         var destination = shaderModule.Add(destinationBase, toTiled ? tiled : linear);
         if (packedWords)

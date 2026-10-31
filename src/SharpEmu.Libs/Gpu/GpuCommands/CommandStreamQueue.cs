@@ -372,6 +372,25 @@ public sealed class CommandStreamQueue
         }
     }
 
+    private ulong _publicationGeneration;
+
+    public void NotifyPublicationCompleted()
+    {
+        lock (_gate)
+        {
+            _publicationGeneration++;
+            var retried = false;
+            foreach (var queue in _queues)
+                if (queue.First is { Value.Blocked: true } head)
+                {
+                    head.Value.Blocked = false;
+                    retried = true;
+                }
+            if (retried) BlockedRetries++;
+            Monitor.PulseAll(_gate);
+        }
+    }
+
     public void RetryBlocked()
     {
         lock (_gate)
@@ -394,8 +413,10 @@ public sealed class CommandStreamQueue
     {
         CommandSubmission? submission = null;
         ControlBarrier? control = null;
+        ulong publicationGeneration;
         lock (_gate)
         {
+            publicationGeneration = _publicationGeneration;
             if (_processing)
             {
                 throw _host.Fatal("The command stream queue is already processing a slice.");
@@ -483,7 +504,7 @@ public sealed class CommandStreamQueue
             SliceResult result;
             if (!complete)
             {
-                submission!.Blocked = true;
+                submission!.Blocked = publicationGeneration == _publicationGeneration;
                 submission.BlockedSinceTicks = System.Diagnostics.Stopwatch.GetTimestamp();
                 submission.BlockedPacketAddress = submission.Commands.CurrentPacketAddress;
                 _queues[submission.QueueId].AddFirst(submission);
@@ -492,7 +513,7 @@ public sealed class CommandStreamQueue
             }
             else
             {
-                if (submission.Kind == CommandSubmissionKind.FrameBoundary)
+                if (submission!.Kind == CommandSubmissionKind.FrameBoundary)
                 {
                     _pendingBoundaries--;
                     _doneCount++;
@@ -535,6 +556,8 @@ public sealed class CommandStreamQueue
 
         var firstSlice = !submission.Started;
         var processor = GetInterpreter(submission.QueueId);
+        if (submission.Completion?.PacketHandlers is { } handlers)
+            processor.SetPacketHandlers(handlers);
         if (firstSlice && submission.ResetInterpreter)
         {
             processor.Reset();
@@ -552,7 +575,8 @@ public sealed class CommandStreamQueue
         SlicesRun++;
         _host.BeginSubmission(submission.QueueId, submission.SubmissionId, submission.GeometrySnapshots);
         processor.ConstantEngineComplete = true;
-        var complete = processor.Process(submission.Commands, submission.Address, submission.DwordCount) == SubmissionProgress.Complete;
+        var complete = processor.Process(submission.Commands, submission.Address, submission.DwordCount,
+            submission.CommandBytes, submission.RegisterTables) == SubmissionProgress.Complete;
         submission.CommandsComplete = complete;
         if (submission.Commands.MadeProgress)
         {
@@ -566,6 +590,12 @@ public sealed class CommandStreamQueue
         else if (complete)
         {
             _host.RunGarbageCollector();
+        }
+
+        if (complete)
+        {
+            submission.Completion?.Consumed();
+            submission.ReleaseCommandBytes();
         }
 
         return complete;

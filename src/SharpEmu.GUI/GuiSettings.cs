@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Text.Json;
+using SharpEmu.GnmMode.Libraries.Np;
 
 namespace SharpEmu.GUI;
 
@@ -39,6 +40,12 @@ public sealed class GuiSettings
 
     /// <summary>Loop the selected game's sce_sys/snd0.at9 preview music.</summary>
     public bool PlayTitleMusic { get; set; } = true;
+
+    public double TitleMusicVolume { get; set; } = 1.0;
+
+    public bool TrophySound { get; set; } = true;
+
+    public string GnmTrophyKey { get; set; } = string.Empty;
 
     public string LibraryLayout { get; set; } = "Carousel";
 
@@ -80,6 +87,8 @@ public sealed class GuiSettings
 
     public string HdrMode { get; set; } = "Auto";
 
+    public string GpuReadbacks { get; set; } = "Full";
+
     public bool OverlayEnabled { get; set; } = true;
     public string OverlayCorner { get; set; } = "TopRight";
     public string OverlayMode { get; set; } = "TitleBar";
@@ -99,9 +108,9 @@ public sealed class GuiSettings
     /// </summary>
     public string DiscordClientId { get; set; } = "1525606762248540221";
 
-    // The emulator is portable and keeps its data next to the executable;
-    // the GUI follows the same convention.
-    public static string SettingsPath => Path.Combine(AppContext.BaseDirectory, "gui-settings.json");
+    // GUI settings live in the user data root (XDG data directory on Linux,
+    // next to the executable on Windows); see SharpEmuPaths.DataRoot.
+    public static string SettingsPath => Path.Combine(SharpEmu.Libs.SharpEmuPaths.DataRoot, "gui-settings.json");
 
     public static GuiSettings Load()
     {
@@ -134,6 +143,8 @@ public sealed class GuiSettings
         settings.EnvironmentToggles = FilterNullOrEmpty(settings.EnvironmentToggles ?? ["SHARPEMU_WRITABLE_APP0", "SHARPEMU_DISABLE_IMPORT_LOOP_GUARD"]);
         settings.LogLevel ??= "Info";
         settings.Language ??= "en";
+        settings.GnmTrophyKey = GnmTrophyPackageReader.TryNormalizeKey(settings.GnmTrophyKey, out var trophyKey)
+            ? trophyKey : string.Empty;
         var legacyProfile = settings.EnvironmentToggles
             .Select(entry => entry.Split('=', 2, StringSplitOptions.TrimEntries))
             .FirstOrDefault(parts =>
@@ -148,6 +159,9 @@ public sealed class GuiSettings
             legacyProfile is { Length: 2 } ? legacyProfile[1] : settings.DefaultProfile);
         settings.DiscordClientId ??= "1525606762248540221";
         settings.LibraryLayout = NormalizeChoice(settings.LibraryLayout, "Carousel", "Grid");
+        settings.TitleMusicVolume = double.IsFinite(settings.TitleMusicVolume)
+            ? Math.Clamp(settings.TitleMusicVolume, 0.0, 1.0)
+            : 1.0;
         settings.ConsoleType = NormalizeChoice(settings.ConsoleType, "PS5");
         settings.ConsoleLanguage = NormalizeChoice(
             settings.ConsoleLanguage,
@@ -186,6 +200,7 @@ public sealed class GuiSettings
         settings.Resolution = NormalizeResolution(settings.Resolution);
         settings.ScalingMode = NormalizeChoice(settings.ScalingMode, "Fit", "Cover", "Stretch", "Integer");
         settings.HdrMode = NormalizeChoice(settings.HdrMode, "Auto", "On", "Off");
+        settings.GpuReadbacks = NormalizeChoice(settings.GpuReadbacks, "Full", "Off");
         settings.BinkPlaybackMode = NormalizeChoice(settings.BinkPlaybackMode, "Guest", "Host", "Skip");
         settings.OverlayCorner = NormalizeChoice(settings.OverlayCorner, "TopRight", "TopLeft", "BottomRight", "BottomLeft");
         settings.OverlayMode = NormalizeChoice(settings.OverlayMode, "TitleBar", "Full", "Minimal");

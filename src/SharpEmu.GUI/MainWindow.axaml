@@ -123,6 +123,10 @@ SPDX-License-Identifier: GPL-2.0-or-later
               Margin="-32,-24,-32,-20"
               Background="{StaticResource GameOptionsMenuBrush}"
               IsVisible="False" />
+      <local:TrophyBackdrop x:Name="TrophyBackdropHost"
+                            Grid.RowSpan="4"
+                            Margin="-32,-24,-32,-20"
+                            IsVisible="False" />
 
       <!-- Library / Options page switcher, with the library toolbar sharing
            the same row on the right. Plain buttons (not TabItem) so there is
@@ -136,6 +140,9 @@ SPDX-License-Identifier: GPL-2.0-or-later
           <Button x:Name="LibraryTabButton"
                   Classes="segment active"
                   Content="{Binding [Page.Library], Source={x:Static local:Localization.Instance}}" />
+          <Button x:Name="TrophiesTabButton"
+                  Classes="segment"
+                  Content="{Binding [Page.Trophies], Source={x:Static local:Localization.Instance}}" />
           <Button x:Name="OptionsTabButton"
                   Classes="segment"
                   Content="{Binding [Page.Options], Source={x:Static local:Localization.Instance}}" />
@@ -146,6 +153,36 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
         <StackPanel Grid.Column="2" x:Name="LibraryToolbar" Orientation="Horizontal" Spacing="8"
                     VerticalAlignment="Center">
+          <Border Background="Transparent"
+                  BorderBrush="{StaticResource CardBorderBrush}"
+                  BorderThickness="1" CornerRadius="8"
+                  Height="32" Padding="2,0,6,0" VerticalAlignment="Center">
+            <StackPanel Orientation="Horizontal" Spacing="2" VerticalAlignment="Center">
+              <Button x:Name="TitleMusicMuteButton"
+                      Classes="iconGhost"
+                      Width="28" Height="28" BorderThickness="0"
+                      VerticalAlignment="Center">
+                <TextBlock x:Name="TitleMusicMuteGlyph"
+                           Classes="materialSymbol compact"
+                           Text="volume_up" />
+              </Button>
+              <Slider x:Name="TitleMusicVolumeSlider"
+                      Width="76" Height="28"
+                      Minimum="0" Maximum="100"
+                      SmallChange="1" LargeChange="10"
+                      VerticalAlignment="Center"
+                      ToolTip.Tip="{Binding [Library.Music.Volume], Source={x:Static local:Localization.Instance}}">
+                <Slider.Resources>
+                  <GridLength x:Key="SliderPreContentMargin">7</GridLength>
+                  <GridLength x:Key="SliderPostContentMargin">7</GridLength>
+                  <x:Double x:Key="SliderHorizontalHeight">24</x:Double>
+                  <x:Double x:Key="SliderHorizontalThumbWidth">14</x:Double>
+                  <x:Double x:Key="SliderHorizontalThumbHeight">14</x:Double>
+                  <CornerRadius x:Key="SliderThumbCornerRadius">7</CornerRadius>
+                </Slider.Resources>
+              </Slider>
+            </StackPanel>
+          </Border>
           <Button x:Name="LibraryLayoutButton"
                   Classes="iconGhost"
                   VerticalAlignment="Center">
@@ -223,12 +260,26 @@ SPDX-License-Identifier: GPL-2.0-or-later
                                HorizontalAlignment="Center" VerticalAlignment="Center" />
                   </MenuItem.Icon>
                 </MenuItem>
+                <MenuItem x:Name="CtxTrophies"
+                          Header="{Binding [Library.Context.Trophies], Source={x:Static local:Localization.Instance}}">
+                  <MenuItem.Icon>
+                    <TextBlock Text="🏆" FontSize="12" Foreground="{StaticResource MutedBrush}"
+                               HorizontalAlignment="Center" VerticalAlignment="Center" />
+                  </MenuItem.Icon>
+                </MenuItem>
                 <Separator />
                 <MenuItem x:Name="CtxGameSettings"
                           Header="{Binding [Library.Context.GameSettings], Source={x:Static local:Localization.Instance}}">
                   <MenuItem.Icon>
                     <TextBlock Text="⚙" FontSize="13" Foreground="{StaticResource MutedBrush}"
                                HorizontalAlignment="Center" VerticalAlignment="Center" />
+                  </MenuItem.Icon>
+                </MenuItem>
+                <MenuItem x:Name="CtxPatches"
+                          Header="{Binding [Library.Context.Patches], Source={x:Static local:Localization.Instance}}">
+                  <MenuItem.Icon>
+                    <PathIcon Width="14" Height="14" Foreground="{StaticResource MutedBrush}"
+                              Data="M9,3 H3 V9 H5 A3,3 0 1 1 5,15 H3 V21 H9 V19 A3,3 0 1 1 15,19 V21 H21 V15 H19 A3,3 0 1 0 19,9 H21 V3 H15 V5 A3,3 0 1 1 9,5 Z" />
                   </MenuItem.Icon>
                 </MenuItem>
                 <Separator />
@@ -361,6 +412,13 @@ SPDX-License-Identifier: GPL-2.0-or-later
                   <TextBlock Text="{Binding VersionText}" FontSize="11" FontWeight="SemiBold"
                              Foreground="{StaticResource MutedBrush}" />
                 </Border>
+                <Border Classes="pill" IsVisible="{Binding CompatibilityMode}">
+                  <TextBlock Text="{Binding [Library.Stat.CompatibilityMode],
+                                            Source={x:Static local:Localization.Instance},
+                                            x:CompileBindings=False}"
+                             FontSize="11" FontWeight="SemiBold"
+                             Foreground="{StaticResource MutedBrush}" />
+                </Border>
                 <Border Classes="pill">
                   <TextBlock Text="{Binding SizeText}" FontSize="11" FontWeight="SemiBold"
                              Foreground="{StaticResource MutedBrush}" />
@@ -433,12 +491,38 @@ SPDX-License-Identifier: GPL-2.0-or-later
           <StackPanel x:Name="LoadingState" Grid.RowSpan="2"
                       Spacing="14" HorizontalAlignment="Center" VerticalAlignment="Center"
                       IsVisible="False">
-            <ProgressBar IsIndeterminate="True" Width="180" Height="3" />
+            <ProgressBar IsIndeterminate="{Binding $parent[StackPanel].IsVisible}" Width="180" Height="3" />
             <TextBlock x:Name="LoadingStateText"
                        Text="{Binding [Library.Loading], Source={x:Static local:Localization.Instance}}"
                        FontSize="13"
                        Foreground="{StaticResource MutedBrush}" HorizontalAlignment="Center" />
           </StackPanel>
+
+          <Border x:Name="ScanningIndicator"
+                  Grid.RowSpan="2"
+                  ZIndex="10"
+                  HorizontalAlignment="Center"
+                  VerticalAlignment="Bottom"
+                  Margin="0,0,0,24"
+                  Padding="18,10"
+                  CornerRadius="18"
+                  Background="#F01B1B1B"
+                  BorderBrush="{StaticResource CardBorderBrush}"
+                  BorderThickness="1"
+                  BoxShadow="0 6 24 0 #80000000"
+                  IsHitTestVisible="False"
+                  IsVisible="False">
+            <StackPanel Orientation="Horizontal" Spacing="12">
+              <ProgressBar IsIndeterminate="{Binding $parent[Border].IsVisible}"
+                           Width="90"
+                           Height="3"
+                           VerticalAlignment="Center" />
+              <TextBlock Text="{Binding [Library.ScanningFolder], Source={x:Static local:Localization.Instance}}"
+                         FontSize="13"
+                         Foreground="{StaticResource SecondaryTextBrush}"
+                         VerticalAlignment="Center" />
+            </StackPanel>
+          </Border>
         </Grid>
 
         <!-- Contextual per-game settings use the same layered reveal as the
@@ -946,6 +1030,21 @@ SPDX-License-Identifier: GPL-2.0-or-later
                                     HorizontalContentAlignment="Left"
                                     VerticalAlignment="Center" />
                         </local:SettingRow>
+
+                        <local:SettingRow x:Name="GameGpuReadbacksRow"
+                                          Classes="optionRow"
+                                          Label="{Binding [Options.GpuReadbacks.Label],
+                                                          Source={x:Static local:Localization.Instance},
+                                                          x:CompileBindings=False}"
+                                          Description="{Binding [Options.GpuReadbacks.Desc],
+                                                                Source={x:Static local:Localization.Instance},
+                                                                x:CompileBindings=False}">
+                          <ComboBox x:Name="GameGpuReadbacksBox"
+                                    Classes="optionValue"
+                                    ItemTemplate="{StaticResource LocalizedChoiceTemplate}"
+                                    HorizontalContentAlignment="Left"
+                                    VerticalAlignment="Center" />
+                        </local:SettingRow>
                         <local:SettingRow x:Name="GameOverlayEnabledRow"
                                           Classes="optionRow"
                                           Label="{Binding [Options.OverlayEnabled.Label], Source={x:Static local:Localization.Instance}, x:CompileBindings=False}"
@@ -1038,6 +1137,10 @@ SPDX-License-Identifier: GPL-2.0-or-later
                           <ToggleSwitch x:Name="GameEnvDumpSpirvToggle"
                                         Classes="optionToggle" />
                         </local:SettingRow>
+                        <local:SettingRow Classes="optionRow" Label="SHARPEMU_SKIP_RT"
+                                          Description="{Binding [Options.Env.SkipRt.Desc], Source={x:Static local:Localization.Instance}, x:CompileBindings=False}">
+                          <ToggleSwitch x:Name="GameEnvSkipRtToggle" Classes="optionToggle" />
+                        </local:SettingRow>
                         <local:SettingRow Classes="optionRow"
                                           Label="SHARPEMU_LOG_DIRECT_MEMORY"
                                           Description="{Binding [Options.Env.LogDirectMemory.Desc],
@@ -1099,6 +1202,8 @@ SPDX-License-Identifier: GPL-2.0-or-later
           </Grid>
         </Border>
         </Grid>
+
+        <local:TrophyPage x:Name="TrophyPageHost" IsVisible="False" Margin="32,14,32,16" />
 
         <!-- Options page: stable local navigation keeps each settings group
              focused while preserving every setting from the current launcher -->
@@ -1171,6 +1276,12 @@ SPDX-License-Identifier: GPL-2.0-or-later
                                  Grid.Column="1"
                                  Classes="optionsNavLabel"
                                  Text="Environment" />
+                    </Grid>
+                  </Button>
+                  <Button x:Name="OptionsGnmModeNav" Classes="optionsNav">
+                    <Grid ColumnDefinitions="36,*">
+                      <TextBlock Grid.Column="0" Classes="materialSymbol optionsNavIcon" Text="sports_esports" />
+                      <TextBlock x:Name="OptionsGnmModeNavLabel" Grid.Column="1" Classes="optionsNavLabel" Text="GnmMode" />
                     </Grid>
                   </Button>
                   <Button x:Name="OptionsAboutNav" Classes="optionsNav">
@@ -1308,6 +1419,25 @@ SPDX-License-Identifier: GPL-2.0-or-later
                 </StackPanel>
               </ScrollViewer>
 
+              <ScrollViewer x:Name="OptionsGnmModePanel" Classes="optionsSectionPanel">
+                <StackPanel>
+                  <Border Classes="optionsGroup">
+                    <StackPanel Spacing="8">
+                      <local:SettingRow Classes="optionRow"
+                                        Label="{Binding [Options.GnmMode.TrophyKey.Label], Source={x:Static local:Localization.Instance}}"
+                                        Description="{Binding [Options.GnmMode.TrophyKey.Desc], Source={x:Static local:Localization.Instance}}">
+                        <StackPanel Spacing="8" Width="330">
+                          <TextBox x:Name="GnmTrophyKeyBox" Classes="optionValue" Width="330" PasswordChar="●" MaxLength="64"
+                                   PlaceholderText="{Binding [Options.GnmMode.TrophyKey.Placeholder], Source={x:Static local:Localization.Instance}}"
+                                   VerticalAlignment="Center" />
+                          <TextBlock x:Name="GnmTrophyKeyError" IsVisible="False" TextWrapping="Wrap" Foreground="#FF8F8F"
+                                     Text="{Binding [Options.GnmMode.TrophyKey.Invalid], Source={x:Static local:Localization.Instance}}" />
+                        </StackPanel>
+                      </local:SettingRow>
+                    </StackPanel>
+                  </Border>
+                </StackPanel>
+              </ScrollViewer>
               <ScrollViewer x:Name="OptionsLauncherPanel"
                             Classes="optionsSectionPanel">
                 <StackPanel>
@@ -1547,11 +1677,29 @@ SPDX-License-Identifier: GPL-2.0-or-later
                                       Classes="optionToggle"
                                       IsChecked="True" />
                       </local:SettingRow>
+                      <local:SettingRow x:Name="PortableDataRow"
+                                        Classes="optionRow"
+                                        Label="{Binding [Options.PortableData.Label], Source={x:Static local:Localization.Instance}}"
+                                        Description="{Binding [Options.PortableData.Desc], Source={x:Static local:Localization.Instance}}">
+                        <ToggleSwitch x:Name="PortableDataToggle"
+                                      Classes="optionToggle"
+                                      IsChecked="False" />
+                      </local:SettingRow>
                       <local:SettingRow x:Name="HdrRow"
                                         Classes="optionRow"
                                         Label="{Binding [Options.Hdr.Label], Source={x:Static local:Localization.Instance}}"
                                         Description="{Binding [Options.Hdr.Desc], Source={x:Static local:Localization.Instance}}">
                         <ComboBox x:Name="HdrModeBox"
+                                  Classes="optionValue"
+                                  ItemTemplate="{StaticResource LocalizedChoiceTemplate}"
+                                  HorizontalContentAlignment="Left"
+                                  VerticalAlignment="Center" />
+                      </local:SettingRow>
+                      <local:SettingRow x:Name="GpuReadbacksRow"
+                                        Classes="optionRow"
+                                        Label="{Binding [Options.GpuReadbacks.Label], Source={x:Static local:Localization.Instance}}"
+                                        Description="{Binding [Options.GpuReadbacks.Desc], Source={x:Static local:Localization.Instance}}">
+                        <ComboBox x:Name="GpuReadbacksBox"
                                   Classes="optionValue"
                                   ItemTemplate="{StaticResource LocalizedChoiceTemplate}"
                                   HorizontalContentAlignment="Left"
@@ -1593,6 +1741,32 @@ SPDX-License-Identifier: GPL-2.0-or-later
                 <StackPanel>
                   <Border Classes="optionsGroup">
                     <StackPanel Spacing="8">
+                      <TextBlock Classes="optionsGroupHeader" Text="{Binding [Options.Env.Group.Trophies], Source={x:Static local:Localization.Instance}}" />
+                      <local:SettingRow Classes="optionRow"
+                                        Label="{Binding [Options.Env.TrophyTest.Label], Source={x:Static local:Localization.Instance}}"
+                                        Description="{Binding [Options.Env.TrophyTest.Desc], Source={x:Static local:Localization.Instance}}">
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                          <ComboBox x:Name="TrophyTestGameBox" Width="220" PlaceholderText="Game" />
+                          <ComboBox x:Name="TrophyTestTrophyBox" Width="260" PlaceholderText="Trophy" />
+                          <Button x:Name="TrophyTestButton"
+                                  Classes="accent"
+                                  Content="{Binding [Options.Env.TrophyTest.Show], Source={x:Static local:Localization.Instance}}" />
+                        </StackPanel>
+                      </local:SettingRow>
+                      <local:SettingRow Classes="optionRow"
+                                        Label="{Binding [Options.Env.TrophySound.Label], Source={x:Static local:Localization.Instance}}"
+                                        Description="{Binding [Options.Env.TrophySound.Desc], Source={x:Static local:Localization.Instance}}">
+                        <ToggleSwitch x:Name="TrophySoundToggle"
+                                      Classes="optionToggle"
+                                      IsChecked="True" />
+                      </local:SettingRow>
+                    </StackPanel>
+                  </Border>
+
+                  <Border Classes="optionsGroup">
+                    <StackPanel Spacing="8">
+                      <Border Classes="optionsGroupDivider" />
+
                       <TextBlock Classes="optionsGroupHeader" Text="{Binding [Options.Env.Group.Debug], Source={x:Static local:Localization.Instance}}" />
                       <local:SettingRow x:Name="PerformanceProfileRow" Classes="optionRow" LabelFontFamily="Consolas,monospace" Label="SHARPEMU_PROFILE_PERFORMANCE"
                                         Description="{Binding [Options.Env.PerformanceProfile.Desc], Source={x:Static local:Localization.Instance}}">
@@ -1629,6 +1803,10 @@ SPDX-License-Identifier: GPL-2.0-or-later
                       <local:SettingRow x:Name="EnvDumpSpirvRow" Classes="optionRow" LabelFontFamily="Consolas,monospace" Label="SHARPEMU_DUMP_SPIRV"
                                         Description="{Binding [Options.Env.DumpSpirv.Desc], Source={x:Static local:Localization.Instance}}">
                         <ToggleSwitch x:Name="EnvDumpSpirvToggle" Classes="optionToggle" />
+                      </local:SettingRow>
+                      <local:SettingRow Classes="optionRow" LabelFontFamily="Consolas,monospace" Label="SHARPEMU_SKIP_RT"
+                                        Description="{Binding [Options.Env.SkipRt.Desc], Source={x:Static local:Localization.Instance}}">
+                        <ToggleSwitch x:Name="EnvSkipRtToggle" Classes="optionToggle" />
                       </local:SettingRow>
 
                       <local:SettingRow x:Name="EnvLogDirectMemoryRow" Classes="optionRow" LabelFontFamily="Consolas,monospace" Label="SHARPEMU_LOG_DIRECT_MEMORY"

@@ -21,6 +21,7 @@ public partial class MainWindow
         "SHARPEMU_WRITABLE_APP0",
         "SHARPEMU_VK_VALIDATION",
         "SHARPEMU_DUMP_SPIRV",
+        "SHARPEMU_SKIP_RT",
         "SHARPEMU_LOG_DIRECT_MEMORY",
         "SHARPEMU_LOG_IO",
         "SHARPEMU_LOG_NP",
@@ -46,6 +47,7 @@ public partial class MainWindow
         GameWindowModeBox.ItemsSource = _windowModeChoices;
         GameScalingModeBox.ItemsSource = _scalingModeChoices;
         GameHdrModeBox.ItemsSource = _hdrModeChoices;
+        GameGpuReadbacksBox.ItemsSource = _gpuReadbackChoices;
         GameOverlayModeBox.ItemsSource = _overlayModeChoices;
         GameOverlayCornerBox.ItemsSource = _overlayCornerChoices;
 
@@ -116,6 +118,7 @@ public partial class MainWindow
         GameScalingModeBox.SelectionChanged += (_, _) => PersistOpenGameSettings();
         GameVSyncToggle.IsCheckedChanged += (_, _) => PersistOpenGameSettings();
         GameHdrModeBox.SelectionChanged += (_, _) => PersistOpenGameSettings();
+        GameGpuReadbacksBox.SelectionChanged += (_, _) => PersistOpenGameSettings();
         GameOverlayEnabledToggle.IsCheckedChanged += (_, _) => PersistOpenGameSettings();
         GameOverlayModeBox.SelectionChanged += (_, _) => PersistOpenGameSettings();
         GameOverlayCornerBox.SelectionChanged += (_, _) => PersistOpenGameSettings();
@@ -224,6 +227,10 @@ public partial class MainWindow
                 _hdrModeChoices,
                 effective.HdrMode,
                 "Auto");
+            GameGpuReadbacksBox.SelectedItem = FindChoice(
+                _gpuReadbackChoices,
+                effective.GpuReadbacks,
+                "Full");
 
             _gameHostDisplays = HostDisplayOptions.BuildDisplays(
                 HostDisplayCatalog.Query(),
@@ -284,6 +291,7 @@ public partial class MainWindow
             ScalingMode = SelectedComboText(GameScalingModeBox, "Fit"),
             VSync = GameVSyncToggle.IsChecked == true,
             HdrMode = SelectedComboText(GameHdrModeBox, "Auto"),
+            GpuReadbacks = SelectedComboText(GameGpuReadbacksBox, "Full"),
             OverlayEnabled = GameOverlayEnabledToggle.IsChecked == true,
             OverlayMode = SelectedComboText(GameOverlayModeBox, "TitleBar"),
             OverlayCorner = SelectedComboText(GameOverlayCornerBox, "TopRight"),
@@ -387,6 +395,8 @@ public partial class MainWindow
         {
             if (name == StrictComputeSettings.VariableName)
                 StrictComputeSettings.SetEnabled(entries, toggle.IsChecked == true);
+            else if (name == RayTracingSkipSettings.VariableName)
+                RayTracingSkipSettings.SetEnabled(entries, toggle.IsChecked == true);
             else if (toggle.IsChecked == true)
             {
                 entries.Add(name);
@@ -408,6 +418,7 @@ public partial class MainWindow
     private static bool IsEnvironmentEnabled(IEnumerable<string> entries, string name)
     {
         if (name == StrictComputeSettings.VariableName) return StrictComputeSettings.IsEnabled(entries);
+        if (name == RayTracingSkipSettings.VariableName) return RayTracingSkipSettings.IsEnabled(entries);
         foreach (var entry in entries)
         {
             var parts = entry.Split('=', 2, StringSplitOptions.TrimEntries);
@@ -499,6 +510,7 @@ public partial class MainWindow
         ("SHARPEMU_WRITABLE_APP0", GameEnvWritableApp0Toggle),
         ("SHARPEMU_VK_VALIDATION", GameEnvVkValidationToggle),
         ("SHARPEMU_DUMP_SPIRV", GameEnvDumpSpirvToggle),
+        ("SHARPEMU_SKIP_RT", GameEnvSkipRtToggle),
         ("SHARPEMU_LOG_DIRECT_MEMORY", GameEnvLogDirectMemoryToggle),
         ("SHARPEMU_LOG_IO", GameEnvLogIoToggle),
         ("SHARPEMU_LOG_NP", GameEnvLogNpToggle),

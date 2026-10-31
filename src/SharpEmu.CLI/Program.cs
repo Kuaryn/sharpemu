@@ -3,9 +3,11 @@
 
 using SharpEmu.Core.Runtime;
 using SharpEmu.Core.Cpu;
+using SharpEmu.GnmMode;
 using SharpEmu.GUI;
 using SharpEmu.HLE;
 using SharpEmu.HLE.FileSystem;
+using SharpEmu.HLE.Host.Windows;
 using SharpEmu.Libs.VideoOut;
 using SharpEmu.Logging;
 using System.Runtime.InteropServices;
@@ -30,9 +32,16 @@ internal static partial class Program
     private const int STARTF_USESTDHANDLES = 0x00000100;
     private const uint HANDLE_FLAG_INHERIT = 0x00000001;
     private const string MitigatedChildEnvironment = "SHARPEMU_MITIGATED_CHILD";
-    private const ulong PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_OFF = 0x00000002UL << 40;
-    private const ulong PROCESS_CREATION_MITIGATION_POLICY2_CET_USER_SHADOW_STACKS_ALWAYS_OFF = 0x00000002UL << 28;
-    private const ulong PROCESS_CREATION_MITIGATION_POLICY2_USER_CET_SET_CONTEXT_IP_VALIDATION_ALWAYS_OFF = 0x00000002UL << 32;
+    private const string YoungGenerationSizeEnvironment = "DOTNET_GCgen0size";
+    private const string YoungGenerationSize = "10000000";
+    private const string SurvivorGenerationBudgetEnvironment = "DOTNET_GCGen1MaxBudget";
+    private const string SurvivorGenerationBudget = "8000000";
+    private static readonly (string Name, string Value)[] ServerGarbageCollector =
+    [
+        ("DOTNET_gcServer", "1"),
+        ("DOTNET_GCHeapCount", "4"),
+        ("DOTNET_GCNoAffinitize", "1"),
+    ];
     private const int ATTACH_PARENT_PROCESS = -1;
     private const int STD_INPUT_HANDLE = -10;
     private const int STD_OUTPUT_HANDLE = -11;
@@ -92,6 +101,23 @@ internal static partial class Program
         }
 
         args = NormalizeInternalArguments(args, out var isMitigatedChild);
+        if (!isMitigatedChild && Environment.GetEnvironmentVariable(YoungGenerationSizeEnvironment) is null)
+        {
+            Environment.SetEnvironmentVariable(YoungGenerationSizeEnvironment, YoungGenerationSize);
+        }
+
+        if (!isMitigatedChild && Environment.GetEnvironmentVariable(SurvivorGenerationBudgetEnvironment) is null)
+        {
+            Environment.SetEnvironmentVariable(SurvivorGenerationBudgetEnvironment, SurvivorGenerationBudget);
+        }
+
+        foreach (var (name, value) in ServerGarbageCollector)
+        {
+            if (!isMitigatedChild && Environment.GetEnvironmentVariable(name) is null)
+            {
+                Environment.SetEnvironmentVariable(name, value);
+            }
+        }
 
         if (args.Length == 0)
         {
@@ -112,17 +138,11 @@ internal static partial class Program
             return 5;
         }
 
-        if (OperatingSystem.IsMacOS() || OperatingSystem.IsLinux())
+        if (OperatingSystem.IsLinux())
         {
-            if (OperatingSystem.IsMacOS())
-            {
-                ConfigureMoltenVkDefaults();
-                PreloadMacVulkanLoader();
-            }
-
-            // SDL/AppKit window work belongs on the process main thread on
-            // macOS. Linux uses the same model for consistent X11/Wayland
-            // event ownership. Emulation remains on a worker thread.
+            // Linux keeps SDL window work on the process main thread for
+            // consistent X11/Wayland event ownership. Emulation remains on a
+            // worker thread.
             var exitCode = 0;
             HostMainThread.Enable();
             var emulation = new Thread(() =>
@@ -151,10 +171,8 @@ internal static partial class Program
     /// <summary>
     /// The supported host execution model, checked before any emulation
     /// starts: the CPU backend executes guest x86-64 code natively, so the
-    /// host process must be x86-64 — win-x64/linux-x64 on x64 hardware, or
-    /// osx-x64 under Rosetta 2 on Apple Silicon (Rosetta translates the
-    /// whole process, so it still reports as X64 here). Failing up front on
-    /// any other process architecture distinguishes that from MoltenVK,
+    /// host process must be x86-64 (win-x64/linux-x64). Failing up front on
+    /// any other process architecture distinguishes that from Vulkan,
     /// signal-handler, or guest-memory startup problems.
     /// </summary>
     private static bool CheckHostArchitecture()
@@ -168,81 +186,23 @@ internal static partial class Program
             $"[LOADER][ERROR] Unsupported process architecture " +
             $"{RuntimeInformation.ProcessArchitecture}: guest code executes " +
             "natively, so SharpEmu must run as an x86-64 process.");
-        if (OperatingSystem.IsMacOS())
-        {
-            Console.Error.WriteLine(
-                "[LOADER][ERROR] On Apple Silicon, use the osx-x64 build under " +
-                "Rosetta 2 (install with: softwareupdate --install-rosetta).");
-        }
-
         return false;
-    }
-
-    /// <summary>
-    /// Applies MoltenVK performance defaults before the Vulkan loader is
-    /// loaded. Existing user-provided values always take precedence.
-    /// </summary>
-    private static void ConfigureMoltenVkDefaults()
-    {
-        try
-        {
-            _ = MacSetEnv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0);
-            _ = MacSetEnv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION", "1", 0);
-            _ = MacSetEnv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "1", 0);
-            _ = MacSetEnv("MVK_CONFIG_RESUME_LOST_DEVICE", "1", 0);
-        }
-        catch (Exception exception)
-        {
-            Console.Error.WriteLine(
-                $"[LOADER][WARN] Failed to set MoltenVK defaults: {exception.Message}");
-        }
-    }
-
-    /// <summary>
-    /// Makes a Vulkan loader visible before SDL creates its Vulkan surface.
-    /// Homebrew's Vulkan libraries are arm64-only and cannot load into this
-    /// x86-64 (Rosetta 2) process, so a universal libMoltenVK.dylib placed
-    /// next to the executable (named libvulkan.1.dylib) is preloaded here;
-    /// dyld can then resolve the loader for SDL and Silk.NET.
-    /// </summary>
-    private static void PreloadMacVulkanLoader()
-    {
-        var candidates = new[]
-        {
-            Path.Combine(AppContext.BaseDirectory, "libvulkan.1.dylib"),
-            Path.Combine(AppContext.BaseDirectory, "libMoltenVK.dylib"),
-            Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                ".sharpemu", "x64lib", "libvulkan.1.dylib"),
-        };
-        foreach (var candidate in candidates)
-        {
-            if (File.Exists(candidate) && NativeLibrary.TryLoad(candidate, out _))
-            {
-                Console.Error.WriteLine($"[LOADER][INFO] Vulkan loader preloaded: {candidate}");
-                return;
-            }
-        }
-
-        if (NativeLibrary.TryLoad("libvulkan.1.dylib", out _))
-        {
-            return;
-        }
-
-        Console.Error.WriteLine(
-            "[LOADER][WARN] No x86-64 Vulkan loader found; video output will be unavailable. " +
-            "Place a universal libMoltenVK.dylib (from the MoltenVK releases) next to SharpEmu " +
-            "as libvulkan.1.dylib.");
     }
 
     private static int RunEmulator(string[] args, bool isMitigatedChild)
     {
         Console.Error.WriteLine($"[DEBUG] SharpEmu starting with {args.Length} args");
 
+        var sessionArgument = args.SingleOrDefault(argument => argument.StartsWith(GnmLoadExecSession.ArgumentPrefix, StringComparison.Ordinal));
+        if (!isMitigatedChild && sessionArgument is null && TryRunGnmSupervisor(args, out var supervisedExitCode))
+            return supervisedExitCode;
         if (!isMitigatedChild && TryRunMitigatedChild(args, out var childExitCode))
         {
             return childExitCode;
         }
+
+        if (sessionArgument is not null)
+            args = args.Where(argument => !argument.StartsWith(GnmLoadExecSession.ArgumentPrefix, StringComparison.Ordinal)).ToArray();
 
         if (!TryParseArguments(
                 args,
@@ -312,7 +272,18 @@ internal static partial class Program
 
         try
         {
-            using var runtime = SharpEmuRuntime.CreateDefault(runtimeOptions);
+            var gameLoader = GnmRuntime.CreateLoader(ebootPath);
+            using var loadExecSession = sessionArgument is null ? null :
+                GnmLoadExecSession.Open(sessionArgument[GnmLoadExecSession.ArgumentPrefix.Length..], ebootPath);
+            using var runtime = gameLoader is not null
+                ? GnmRuntime.CreateDefault(runtimeOptions with
+                {
+                    AdoptStartupAddressReservations = OperatingSystem.IsWindows() && isMitigatedChild,
+                }, gameLoader, loadExecSession)
+                : SharpEmuRuntime.CreateDefault(runtimeOptions with
+                {
+                    AdoptStartupAddressReservations = OperatingSystem.IsWindows() && isMitigatedChild,
+                });
 
             OrbisGen2Result result;
             ConsoleCancelEventHandler? cancelHandler = null;
@@ -566,14 +537,9 @@ internal static partial class Program
 
             startupInfoEx.lpAttributeList = attributeList;
 
-            var policy1 = PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_OFF;
-            var policy2 =
-                PROCESS_CREATION_MITIGATION_POLICY2_CET_USER_SHADOW_STACKS_ALWAYS_OFF |
-                PROCESS_CREATION_MITIGATION_POLICY2_USER_CET_SET_CONTEXT_IP_VALIDATION_ALWAYS_OFF;
-
             mitigationPolicies = Marshal.AllocHGlobal(sizeof(ulong) * 2);
-            Marshal.WriteInt64(mitigationPolicies, unchecked((long)policy1));
-            Marshal.WriteInt64(nint.Add(mitigationPolicies, sizeof(long)), unchecked((long)policy2));
+            Marshal.WriteInt64(mitigationPolicies, unchecked((long)GuestProcessMitigationPolicy.Primary));
+            Marshal.WriteInt64(nint.Add(mitigationPolicies, sizeof(long)), unchecked((long)GuestProcessMitigationPolicy.Secondary));
 
             if (!UpdateProcThreadAttribute(
                 attributeList,
@@ -598,7 +564,7 @@ internal static partial class Program
                 0,
                 0,
                 true,
-                EXTENDED_STARTUPINFO_PRESENT,
+                EXTENDED_STARTUPINFO_PRESENT | WindowsGuestAddressReservation.CreateSuspended,
                 0,
                 Environment.CurrentDirectory,
                 ref startupInfoEx,
@@ -622,6 +588,7 @@ internal static partial class Program
                     jobHandle = 0;
                 }
 
+                WindowsGuestAddressReservation.PrepareAndResume(processInfo.hProcess, processInfo.hThread);
                 ConsoleCancelEventHandler? cancelHandler = null;
                 EventHandler? processExitHandler = null;
                 cancelHandler = (_, eventArgs) =>
@@ -647,6 +614,12 @@ internal static partial class Program
 
                 childExitCode = unchecked((int)exitCode);
                 Console.Error.WriteLine("[DEBUG] Running in mitigated child process (CET/CFG disabled).");
+                return true;
+            }
+            catch (System.ComponentModel.Win32Exception exception)
+            {
+                childExitCode = 5;
+                Console.Error.WriteLine($"[ERROR] Guest process preparation failed: {exception.Message}");
                 return true;
             }
             finally
@@ -712,8 +685,7 @@ internal static partial class Program
 
     private static string BuildDefaultLogFilePath(string? ebootPath)
     {
-        var baseDirectory = AppContext.BaseDirectory;
-        var logsDirectory = Path.Combine(baseDirectory, "user", "logs");
+        var logsDirectory = Path.Combine(SharpEmu.Libs.SharpEmuPaths.DataRoot, "user", "logs");
         var name = TryReadTitleId(ebootPath) ?? "UNKNOWN";
 
         foreach (var invalid in Path.GetInvalidFileNameChars())
@@ -764,6 +736,8 @@ internal static partial class Program
                     }
                 }
             }
+
+            return GnmRuntime.ReadApplicationInfo(ebootPath).TitleId;
         }
         catch
         {
@@ -835,9 +809,13 @@ internal static partial class Program
                     Directory.CreateDirectory(directory);
                 }
 
+                var sessionArgument = Environment.GetCommandLineArgs()
+                    .FirstOrDefault(argument => argument.StartsWith(GnmLoadExecSession.ArgumentPrefix, StringComparison.Ordinal));
+                var append = sessionArgument is not null &&
+                    GnmLoadExecSession.IsRestart(sessionArgument[GnmLoadExecSession.ArgumentPrefix.Length..]);
                 var stream = new FileStream(
                     path,
-                    FileMode.Create,
+                    append ? FileMode.Append : FileMode.Create,
                     FileAccess.Write,
                     FileShare.ReadWrite,
                     bufferSize: 4096,
@@ -1813,7 +1791,4 @@ internal static partial class Program
         uint creationDisposition,
         uint flagsAndAttributes,
         nint templateFile);
-
-    [DllImport("libSystem", EntryPoint = "setenv")]
-    private static extern int MacSetEnv(string name, string value, int overwrite);
 }

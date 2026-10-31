@@ -26,30 +26,22 @@ internal static unsafe partial class VulkanVideoPresenter
 
         internal GpuWorkerRelay Relay => _relay;
         private readonly SubmissionContext _submissionContext = new();
-        private SubmissionScheduler _scheduler = null!;
-        private VulkanCommandProfile? _gpuCommandProfile;
-        private GpuDeviceInfo _deviceInfo = null!;
-        private GuestBufferCache _bufferCache = null!;
-        private GuestImageCache _imageCache = null!;
-        private SamplerStore _samplerStore = null!;
+        internal SubmissionScheduler _scheduler = null!;
+        internal VulkanCommandProfile? _gpuCommandProfile;
+        internal VulkanOcclusionQueries? _occlusionQueries;
+        internal bool _supportsPreciseOcclusion;
+        internal int _occlusionQueueId;
+        internal GpuDeviceInfo _deviceInfo = null!;
+        internal GuestBufferCache _bufferCache = null!;
+        internal GuestImageCache _imageCache = null!;
+        internal SamplerStore _samplerStore = null!;
 
-        bool IRenderingState.IsRendering => _renderingActive;
+        bool IRenderingState.IsRendering => _recording?._renderingActive ?? false;
 
-        void IRenderingState.EndRendering()
-        {
-            EndRendering();
-        }
+        void IRenderingState.EndRendering() => _recording?.EndRendering();
 
-        bool IRenderingState.TryDeferUntilRenderingEnds(PipelineStageFlags sourceStages, PipelineStageFlags destinationStages, List<ImageMemoryBarrier2> barriers)
-        {
-            if (!_renderingActive)
-            {
-                return false;
-            }
-
-            _barriersAfterRendering.Add((sourceStages, destinationStages, barriers.ToArray()));
-            return true;
-        }
+        bool IRenderingState.TryDeferUntilRenderingEnds(PipelineStageFlags sourceStages, PipelineStageFlags destinationStages, List<ImageMemoryBarrier2> barriers) =>
+            _recording?.TryDeferUntilRenderingEnds(sourceStages, destinationStages, barriers) ?? false;
 
         internal static void WakeRenderThread()
         {
@@ -69,12 +61,18 @@ internal static unsafe partial class VulkanVideoPresenter
             _scheduler = new SubmissionScheduler(
                 tickDevice,
                 this,
-                PrepareGuestSubmission,
+                PrepareSubmission,
                 CompleteGuestSubmission,
                 _ => WakeRenderThread());
         }
 
-        private void RecordRequestedMemoryBarrier(nint handle, MemoryBarrierRequest request)
+        private void PrepareSubmission(SubmitBundle bundle)
+        {
+            _bufferCache?.ApplyPendingGpuProtections();
+            PrepareGuestSubmission(bundle);
+        }
+
+        internal void RecordRequestedMemoryBarrier(nint handle, MemoryBarrierRequest request)
         {
             var barrier = new MemoryBarrier2
             {
@@ -83,7 +81,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 DstAccessMask = VulkanSynchronization.Access(request.DestinationAccess),
             };
             VulkanSynchronization.PipelineBarrier(_vk, new CommandBuffer(handle), request.SourceStages, request.DestinationStages,
-                0, 1, &barrier, 0, null, 0, null);
+                0, 1, &barrier, 0, null, 0, null, BarrierSource.Requested);
         }
 
         // Both stores share the manager's page guard and read guest memory through its address space.
@@ -102,7 +100,14 @@ internal static unsafe partial class VulkanVideoPresenter
             var (memory, guest, backing) = RequireGuestMemory("buffer store");
             _guestBacking = backing;
             _bufferCache = new GuestBufferCache(_deviceInfo, _scheduler, _relay, memory.Pages, guest, backing);
+            _bufferCache.GpuMemory = memory;
+            _bufferCache.CompleteGuestPublications = (address, size, access) => CompleteOverlappingPublications(address, size,
+                includeLabels: access == GuestBufferCache.PublicationAccess.Write,
+                skipGpuSlots: access == GuestBufferCache.PublicationAccess.OverlaidRead);
+            _bufferCache.OverlayGuestPublications = OverlayPendingDumps;
+            _bufferCache.PublicationOrdinal = () => _guestPublications.Ordinal;
             _bufferCache.StreamOffsetAlignment = Math.Max(_bufferCache.StreamOffsetAlignment, GuestStorageBufferOffsetAlignment);
+            _bufferCache.DefersGpuWriteProtection = true;
             if (_readbackQueueFamilyIndex is { } readbackFamily)
             {
                 _bufferCache.AsyncReadback = new Gpu.Vulkan.VulkanAsyncReadback(_deviceInfo, _scheduler, _readbackQueue, readbackFamily);
@@ -134,12 +139,18 @@ internal static unsafe partial class VulkanVideoPresenter
                 _commandStream.StopAccepting();
                 // The command stream thread ends after its slice; the rest drains here.
                 _commandThread?.Stop(() => RunCommandStreamSlices(long.MaxValue));
+                if (_translation is not null)
+                {
+                    _translation.Sink = null;
+                }
                 var outcome = _commandStream.DrainForShutdown(cancelBlockedOnNoProgress: true);
                 FlushBatchedGuestCommands();
+                StopRenderWorkers();
                 Console.Error.WriteLine(
                     $"[LOADER][PERF] command_stream submissions={_commandStream.SubmissionsStarted} " +
                     $"slices={_commandStream.SlicesRun} blocked_retries={_commandStream.BlockedRetries} " +
                     $"outcome={outcome} fatal=0");
+                SharpEmu.Libs.Gpu.Pipelines.ImageDescriptorTrace.WriteHistory();
                 Console.Error.WriteLine($"[LOADER][PERF] {ShaderCacheCounters.Summary()}");
                 _relay.StopAcceptingWork();
                 _relay.RunPendingCommands();
@@ -169,7 +180,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        private CommandBuffer CurrentRecordingBuffer()
+        internal CommandBuffer CurrentRecordingBuffer()
         {
             if (!_scheduler.Active)
             {
@@ -179,7 +190,7 @@ internal static unsafe partial class VulkanVideoPresenter
             return new CommandBuffer(_scheduler.Current.Handle);
         }
 
-        private RecordingBuffer CurrentRecording()
+        internal RecordingBuffer CurrentRecording()
         {
             if (!_scheduler.Active)
             {

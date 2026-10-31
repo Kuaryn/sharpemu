@@ -36,6 +36,8 @@ public sealed class PerGameSettings
 
     public string? HdrMode { get; set; }
 
+    public string? GpuReadbacks { get; set; }
+
     public bool? OverlayEnabled { get; set; }
     public string? OverlayCorner { get; set; }
     public string? OverlayMode { get; set; }
@@ -57,6 +59,7 @@ public sealed class PerGameSettings
         ScalingMode is null &&
         VSync is null &&
         HdrMode is null &&
+        GpuReadbacks is null &&
         OverlayEnabled is null &&
         OverlayCorner is null &&
         OverlayMode is null &&
@@ -64,7 +67,7 @@ public sealed class PerGameSettings
         CustomEnvironmentVariables is null;
 
     public static string DirectoryPath =>
-        Path.Combine(AppContext.BaseDirectory, "user", "custom_configs");
+        Path.Combine(SharpEmu.Libs.SharpEmuPaths.DataRoot, "user", "custom_configs");
 
     public static string PathFor(string titleId) =>
         Path.Combine(DirectoryPath, SanitizeTitleId(titleId) + ".json");
@@ -168,6 +171,11 @@ public sealed class PerGameSettings
         if (string.Equals(HdrMode, global.HdrMode, StringComparison.OrdinalIgnoreCase))
         {
             HdrMode = null;
+        }
+
+        if (string.Equals(GpuReadbacks, global.GpuReadbacks, StringComparison.OrdinalIgnoreCase))
+        {
+            GpuReadbacks = null;
         }
 
         if (OverlayEnabled == global.OverlayEnabled)
@@ -280,7 +288,8 @@ public sealed record EffectiveLaunchSettings(
     bool OverlayEnabled,
     string OverlayCorner,
     string OverlayMode,
-    IReadOnlyList<string> EnvironmentToggles)
+    IReadOnlyList<string> EnvironmentToggles,
+    string GpuReadbacks)
 {
     public static EffectiveLaunchSettings Resolve(GuiSettings global, PerGameSettings? perGame) => new(
         perGame?.LogLevel ?? global.LogLevel,
@@ -297,5 +306,6 @@ public sealed record EffectiveLaunchSettings(
         perGame?.OverlayEnabled ?? global.OverlayEnabled,
         perGame?.OverlayCorner ?? global.OverlayCorner,
         perGame?.OverlayMode ?? global.OverlayMode,
-        perGame?.EnvironmentToggles ?? global.EnvironmentToggles);
+        perGame?.EnvironmentToggles ?? global.EnvironmentToggles,
+        perGame?.GpuReadbacks ?? global.GpuReadbacks);
 }
