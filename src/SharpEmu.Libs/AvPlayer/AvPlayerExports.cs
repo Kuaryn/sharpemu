@@ -12,7 +12,6 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
-using System.Threading.Channels;
 
 namespace SharpEmu.Libs.AvPlayer;
 
@@ -301,7 +300,7 @@ public static class AvPlayerExports
     {
         private readonly Stream _stream;
         private readonly int _frameByteCount;
-        private readonly Channel<byte[]> _frames;
+        private readonly BlockingCollection<byte[]> _frames;
         private readonly ConcurrentQueue<byte[]> _reusableFrames = new();
         private byte[]? _currentFrame;
         private readonly CancellationTokenSource _stop = new();
@@ -316,13 +315,8 @@ public static class AvPlayerExports
         {
             _stream = stream;
             _frameByteCount = frameByteCount;
-            _frames = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(
-                Math.Clamp(capacity, MinimumFrameBufferCount, MaximumFrameBufferCount))
-            {
-                FullMode = BoundedChannelFullMode.Wait,
-                SingleReader = true,
-                SingleWriter = true,
-            });
+            _frames = new BlockingCollection<byte[]>(
+                Math.Clamp(capacity, MinimumFrameBufferCount, MaximumFrameBufferCount));
             _worker = new Thread(DecodeFrames)
             {
                 IsBackground = true,
@@ -334,7 +328,7 @@ public static class AvPlayerExports
         public VideoFrameReadResult TryRead(out byte[]? frame)
         {
             var completed = Volatile.Read(ref _completed) != 0;
-            if (_frames.Reader.TryRead(out frame))
+            if (_frames.TryTake(out frame))
             {
                 // The consumer keeps this frame until the next successful read.
                 // Storage belongs to this queue and is never shared with a new playback.
@@ -352,7 +346,7 @@ public static class AvPlayerExports
                 : VideoFrameReadResult.Pending;
         }
 
-        public int QueuedFrameCount => _frames.Reader.Count;
+        public int QueuedFrameCount => _frames.Count;
 
         private void DecodeFrames()
         {
@@ -369,10 +363,8 @@ public static class AvPlayerExports
                         break;
                     }
 
-                    _frames.Writer.WriteAsync(frame, _stop.Token)
-                        .AsTask()
-                        .GetAwaiter()
-                        .GetResult();
+                    // Backpressure on this dedicated thread must not need a thread-pool continuation.
+                    _frames.Add(frame, _stop.Token);
                 }
             }
             catch (OperationCanceledException) when (_stop.IsCancellationRequested)
@@ -381,7 +373,7 @@ public static class AvPlayerExports
             catch (ObjectDisposedException) when (_stop.IsCancellationRequested)
             {
             }
-            catch (ChannelClosedException) when (_stop.IsCancellationRequested)
+            catch (InvalidOperationException) when (_stop.IsCancellationRequested)
             {
             }
             catch (IOException exception)
@@ -392,7 +384,7 @@ public static class AvPlayerExports
             finally
             {
                 Volatile.Write(ref _completed, 1);
-                _frames.Writer.TryComplete();
+                _frames.CompleteAdding();
                 _stream.Dispose();
             }
         }
@@ -406,7 +398,7 @@ public static class AvPlayerExports
 
             _stop.Cancel();
             _stream.Dispose();
-            _frames.Writer.TryComplete();
+            _frames.CompleteAdding();
         }
     }
 
