@@ -747,7 +747,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // Revalidation compares current words in scratch; only a changed entry needs a new retained array.
         private int ReadHeapRecord(HeapEntry entry, Span<uint> words)
         {
-            if (entry.Region is not { } region || !region.Holds(entry.Index))
+            if (entry.Region is not { } region || !region.Names(entry.Index))
             {
                 return 0;
             }

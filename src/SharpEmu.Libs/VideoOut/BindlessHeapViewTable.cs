@@ -29,6 +29,9 @@ internal sealed class BindlessHeapViewTable(uint capacity)
 
         public bool Holds(uint element) => element >= View.First && element - View.First < Extent;
 
+        // An element of a record the heap names now: a table that moved to the run may have fewer records than the run holds.
+        public bool Names(uint element) => element >= View.First && element - View.First < View.Records;
+
         // The run's descriptors as a heap of their own, for reading them in guest memory: the first one's address, a
         // stride apart, each of the size its heap reads (an R128 view's are 16 bytes).
         public BindlessHeapDescriptor Descriptors =>

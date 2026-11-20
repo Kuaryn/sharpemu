@@ -116,6 +116,9 @@ public sealed class BindlessHeapViewTableTests
         Assert.Same(first, fewer);
         Assert.Equal(new HeapView(0, 632, 0, 1487), fewer.View);
         Assert.True(fewer.Holds(1667));
+        // Its elements past the table's records name no record: the guest bytes there are not this table's.
+        Assert.True(fewer.Names(1486));
+        Assert.False(fewer.Names(1487));
 
         var more = table.Acquire(Table(0x9000, 1700, stride: 632), tick: 5, completedTick: 3, Unreleased, out moved)!;
         Assert.False(moved);
