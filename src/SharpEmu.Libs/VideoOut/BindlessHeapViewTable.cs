@@ -90,7 +90,7 @@ internal sealed class BindlessHeapViewTable(uint capacity)
         if (grownFrom is null && FindShape(heap, shape, tick, completedTick) is { } idle)
         {
             moved = true;
-            return Move(idle, heap, tick, frame);
+            return Move(idle, heap, records, tick, frame);
         }
 
         int position;
@@ -132,7 +132,7 @@ internal sealed class BindlessHeapViewTable(uint capacity)
                 }
 
                 moved = true;
-                return Move(shared, heap, tick, frame);
+                return Move(shared, heap, records, tick, frame);
             }
 
             Release(oldest, released);
@@ -144,14 +144,17 @@ internal sealed class BindlessHeapViewTable(uint capacity)
         return region;
     }
 
-    // The least recently used run of a view of this shape last used before tick and at or before completedTick.
+    // The least recently used run of a view of this shape last used before tick and at or before completedTick. A run
+    // with room for the view's records serves it: a table the guest builds for each frame (a culling pass's objects)
+    // names another count of records each time.
     private Region? FindShape(in BindlessHeapDescriptor heap, HeapView shape, ulong tick, ulong completedTick)
     {
         Region? found = null;
         foreach (var candidate in _regions)
         {
             if (candidate.Heap.Sampler == heap.Sampler && candidate.Heap.R128 == heap.R128 &&
-                candidate.Heap.PointeeOffset == heap.PointeeOffset && candidate.View with { First = 0 } == shape &&
+                candidate.Heap.PointeeOffset == heap.PointeeOffset && candidate.View.Stride == shape.Stride &&
+                candidate.View.FieldOffset == shape.FieldOffset && candidate.Extent >= shape.Records &&
                 candidate.LastUsedTick <= completedTick && candidate.LastUsedTick < tick &&
                 (found is null || candidate.LastUsedTick < found.LastUsedTick))
             {
@@ -162,10 +165,11 @@ internal sealed class BindlessHeapViewTable(uint capacity)
         return found;
     }
 
-    private Region Move(Region region, in BindlessHeapDescriptor heap, ulong tick, long frame)
+    private Region Move(Region region, in BindlessHeapDescriptor heap, uint records, ulong tick, long frame)
     {
         ForgetHeap(region);
         region.Heap = heap;
+        region.View = region.View with { Records = records };
         region.LastUsedTick = tick;
         region.LastUsedFrame = frame;
         _byHeap.Add(heap, region);

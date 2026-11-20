@@ -101,6 +101,33 @@ public sealed class BindlessHeapViewTableTests
         Assert.Equal(46u, back.View.First);
     }
 
+    // A table the guest builds for each frame (Ghost of Yotei's grass cull: one record per object in view) names another
+    // count of records each time. It takes over a completed run with room for its records and reads only those, so the
+    // elements the shaders marked stay resolved; a new run for every count left every element null each frame. A table
+    // with more records than any idle run holds gets a run of its own.
+    [Fact]
+    public void AMovedTableWithAnotherCountTakesOverARunWithRoomForIt()
+    {
+        var table = new BindlessHeapViewTable(10000);
+        var first = table.Acquire(Table(0x1000, 1668, stride: 632), tick: 1, completedTick: 0, Unreleased, out _)!;
+
+        var fewer = table.Acquire(Table(0x5000, 1487, stride: 632), tick: 3, completedTick: 1, Unreleased, out var moved)!;
+        Assert.True(moved);
+        Assert.Same(first, fewer);
+        Assert.Equal(new HeapView(0, 632, 0, 1487), fewer.View);
+        Assert.True(fewer.Holds(1667));
+
+        var more = table.Acquire(Table(0x9000, 1700, stride: 632), tick: 5, completedTick: 3, Unreleased, out moved)!;
+        Assert.False(moved);
+        Assert.NotSame(first, more);
+        Assert.Equal(new HeapView(1668, 632, 0, 1700), more.View);
+
+        var again = table.Acquire(Table(0xD000, 1600, stride: 632), tick: 7, completedTick: 5, Unreleased, out moved)!;
+        Assert.True(moved);
+        Assert.Same(first, again);
+        Assert.Equal(1600u, again.View.Records);
+    }
+
     // A view of 16-byte T#s (R128) and a view of 32-byte T#s over records of one shape resolve different descriptors:
     // neither takes over the other's run.
     [Fact]
