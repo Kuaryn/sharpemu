@@ -1619,14 +1619,24 @@ public sealed partial class ResourceTracker
         }
 
         var reads = handle.Operands.Select(Invariant).ToArray();
-        var first = ScalarReadMemory(reads[0], out _);
+        // A descriptor read through a pointer that a heap record holds: the record's pointer field is the key, and the
+        // descriptor lies at the reads' immediate offset past what it points at.
+        var key = reads[0];
+        uint? pointee = null;
+        if (PointerFieldOf(reads[0]) is { } field)
+        {
+            key = field;
+            pointee = _plan.Memory[reads[0].MemoryIndex].Offset;
+        }
+
+        var first = ScalarReadMemory(key, out var keyMemoryIndex);
         if (first is null)
         {
             return;
         }
 
-        var heapHandle = reads[0].Operands[0];
-        var offset = reads[0].Operands[1];
+        var heapHandle = key.Operands[0];
+        var offset = key.Operands[1];
         if (heapHandle.Kind != ScalarValueKind.BufferHandle || _plan.ValidateRuntimeValue(offset))
         {
             return;
@@ -1638,9 +1648,12 @@ public sealed partial class ResourceTracker
         for (var dword = 0; dword < width; dword++)
         {
             var read = reads[dword];
-            var memory = ScalarReadMemory(read, out var memoryIndex);
-            if (memory is null || memory.Offset != first.Offset + (uint)dword * sizeof(uint) ||
-                !_graph.Equivalent(read.Operands[0], heapHandle) || !_graph.Equivalent(read.Operands[1], offset))
+            var memory = pointee is null ? ScalarReadMemory(read, out var memoryIndex) : PointeeReadMemory(read, out memoryIndex);
+            if (memory is null ||
+                (pointee is null
+                    ? memory.Offset != first.Offset + (uint)dword * sizeof(uint) ||
+                      !_graph.Equivalent(read.Operands[0], heapHandle) || !_graph.Equivalent(read.Operands[1], offset)
+                    : memory.Offset != pointee.Value + (uint)dword * sizeof(uint) || !_graph.Equivalent(read.Operands[0], reads[0].Operands[0])))
             {
                 return;
             }
@@ -1660,8 +1673,9 @@ public sealed partial class ResourceTracker
         var source = InternSource(new DescriptorSource
         {
             Dwords = Enumerable.Repeat(_graph.Constant(0u), width).ToArray(),
-            Heap = new HeapRecordSelector(heapSource, memoryIndices[0], first.Offset, (uint)width * sizeof(uint))
+            Heap = new HeapRecordSelector(heapSource, keyMemoryIndex, first.Offset, (uint)width * sizeof(uint))
             {
+                PointeeOffset = pointee,
                 Cube = !sampler && instruction?.Control is Gen5ImageControl { Dimension: 3 },
                 R128 = !sampler && instruction is { Control: Gen5ImageControl, Words.Count: > 0 } && ((instruction.Words[0] >> 15) & 1) != 0,
             },
@@ -1676,6 +1690,39 @@ public sealed partial class ResourceTracker
             Reads = reads,
         });
         _info.UsesBindlessHeap = true;
+    }
+
+    // A scalar address read at an immediate offset from an address pair that is one 64-bit pointer field, both halves read
+    // from one heap V# at the same offset: the low half's read, or null.
+    private ScalarValue? PointerFieldOf(ScalarValue read)
+    {
+        if (PointeeReadMemory(read, out _) is null || read.Operands[0] is not { Kind: ScalarValueKind.AddressHandle, Operands.Length: 2 } address)
+        {
+            return null;
+        }
+
+        var low = Invariant(address.Operands[0]);
+        var high = Invariant(address.Operands[1]);
+        var lowMemory = ScalarReadMemory(low, out _);
+        var highMemory = ScalarReadMemory(high, out _);
+        return lowMemory is not null && highMemory is not null && highMemory.Offset == lowMemory.Offset + sizeof(uint) &&
+            _graph.Equivalent(low.Operands[0], high.Operands[0]) && _graph.Equivalent(low.Operands[1], high.Operands[1])
+            ? low
+            : null;
+    }
+
+    // One dword a scalar load reads at an immediate offset from an address pair.
+    private MemoryAccessInfo? PointeeReadMemory(ScalarValue read, out int index)
+    {
+        index = read.MemoryIndex;
+        if (read.Kind != ScalarValueKind.ScalarAddressWord || index < 0 || index >= _plan.Memory.Count ||
+            read.Operands[1] is not { IsConstant: true, ConstantU32: 0 })
+        {
+            return null;
+        }
+
+        var memory = _plan.Memory[index];
+        return memory.Kind == MemoryResourceKind.ScalarAddress && memory.DataBits == 32 && memory.DataDwords == 1 ? memory : null;
     }
 
     // ---- indirect images ----

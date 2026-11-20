@@ -202,7 +202,7 @@ public sealed partial class ShaderResourcePlan
     public HeapRecordSource HeapRecordSourceOf(HeapRecordAccess record)
     {
         var heap = DescriptorSources[(int)record.Source].Heap!;
-        return new HeapRecordSource(heap.HeapSource, record.Sampler, heap.Immediate, heap.R128);
+        return new HeapRecordSource(heap.HeapSource, record.Sampler, heap.Immediate, heap.R128, heap.PointeeOffset);
     }
 
     // That view's number among HeapRecordSources.

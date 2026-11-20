@@ -259,6 +259,68 @@ public sealed class BindlessHeapTests
             (last.Word0 & HeapView.ElementMask, last.Word0 >> HeapView.ElementBits, last.Word1 & HeapView.ElementMask, last.Word1 >> HeapView.ElementBits));
     }
 
+    // A T# read through a pointer that a heap record holds (Ghost of Yotei's grass occlusion cull samples its depth
+    // pyramid through a per-object record's pointer, inside a per-object waterfall) is a heap record of that table: the
+    // pointer field is the key, and the descriptor lies at the load's immediate past the pointer's target. It used to read
+    // as a null image, so the cull dropped nearly every grass instance.
+    [Fact]
+    public void AnImageReadThroughAPointerAHeapRecordHoldsIsAHeapRecord()
+    {
+        var program = Program(
+            MoveScalarRegister(0, 16, 0),
+            MoveScalarRegister(4, 17, 1),
+            MoveScalarRegister(8, 18, 2),
+            MoveScalarRegister(12, 19, 3),
+            MoveScalarRegister(16, 24, 4),
+            MoveScalarRegister(20, 25, 5),
+            MoveScalarRegister(24, 26, 6),
+            MoveScalarRegister(28, 27, 7),
+            ReadFirstLane(32, 106, 7),
+            Sop2(36, "SMulI32", 106, Gen5Operand.Scalar(106), Operand(0x278)),
+            // s[20:21] = the pointer at +8 of the record the first lane picks; the T# lies 0x558 bytes past its target.
+            ScalarBufferLoad(40, 16, destination: 20, count: 2, immediateOffset: 8, dynamicOffsetRegister: 106),
+            ScalarLoad(48, 20, destination: 0, count: 8, immediateOffset: 0x558),
+            Image(56, "ImageSample", 0, 24),
+            EndProgram(64));
+
+        var plan = Extract(program, stage: ShaderStage.Compute, bindlessNullDescriptors: true, bindlessHeap: true);
+
+        Assert.Empty(plan.NullBindlessDescriptorPcs);
+        var record = Assert.Single(plan.HeapRecords);
+        var heap = plan.DescriptorSources[(int)record.Source].Heap!;
+        Assert.Equal((8u, BindlessHeap.ImageRecordBytes, (uint?)0x558), (heap.Immediate, heap.RecordBytes, heap.PointeeOffset));
+        Assert.Equal(40u, plan.Memory[heap.KeyMemoryIndex].Pc);
+        Assert.Equal(new HeapRecordSource(heap.HeapSource, false, 8, PointeeOffset: 0x558), Assert.Single(plan.HeapRecordSources));
+        for (var component = 0u; component < 8; component++)
+        {
+            Assert.True(plan.Memory.TryGetIndex(48, component, out var index));
+            Assert.True(plan.Memory[index].PlanningOnly);
+        }
+
+        var request = Request(program, bindlessHeap: true);
+        Assert.Contains(heap.KeyMemoryIndex, request.IndirectOffsetKeyMemoryIndices);
+        Assert.Equal([0u, BindlessHeap.FeedbackBinding], Compile(request).SetOneBindings);
+    }
+
+    // The records of a pointer view hold 8-byte pointers: a table of 0x278-byte records is one element per record, a packed
+    // array one per pointer, and the descriptor is the offset past the pointer's 48-bit target (none for a null pointer).
+    [Fact]
+    public void APointerViewsRecordsHoldPointers()
+    {
+        var table = new BindlessHeapDescriptor(false, 0x0001_0000, 12, 0x278, 0, PointeeOffset: 0x558);
+        Assert.Equal(new HeapView(100, 0x278, 0, 12), HeapView.Of(table, first: 100, records: 12));
+        Assert.Equal(12u, table.ViewRecords);
+        Assert.Equal(0x0001_0000ul + 3 * 0x278, HeapView.Of(table, 100, 12).DescriptorAddress(table, 3));
+        Assert.Equal(0x0020_1322_C570ul + 0x558, table.PointeeAddress([0x1322_C570, 0xABCD_0020]));
+        Assert.Equal(0ul, table.PointeeAddress([0, 0]));
+
+        var packed = new BindlessHeapDescriptor(false, 0x0002_0000, 64, 8, 0, PointeeOffset: 16);
+        Assert.Equal(new HeapView(0, 8, 0, 64), HeapView.Of(packed, first: 0, records: 64));
+        Assert.Equal(new HeapView(0, 8, 0, 128), HeapView.Of(packed with { Stride = 0 }, first: 0, records: 128));
+        Assert.Equal(128u, (packed with { Stride = 0, Records = 1024 }).ViewRecords);
+        Assert.NotEqual(table.ViewKey, (table with { PointeeOffset = 0x580 }).ViewKey);
+    }
+
     // A T# with RESOURCE_LEVEL set (word 2 bit 31, a GFX10 field) is a texture like any other: terrain
     // tile records hold their R16 height textures that way, and the heap gave them no view, so the terrain cull sampled no
     // height. A freed record (0xFEFEFEFE words) still has reserved bits set.

@@ -150,7 +150,8 @@ internal sealed class BindlessHeapViewTable(uint capacity)
         Region? found = null;
         foreach (var candidate in _regions)
         {
-            if (candidate.Heap.Sampler == heap.Sampler && candidate.Heap.R128 == heap.R128 && candidate.View with { First = 0 } == shape &&
+            if (candidate.Heap.Sampler == heap.Sampler && candidate.Heap.R128 == heap.R128 &&
+                candidate.Heap.PointeeOffset == heap.PointeeOffset && candidate.View with { First = 0 } == shape &&
                 candidate.LastUsedTick <= completedTick && candidate.LastUsedTick < tick &&
                 (found is null || candidate.LastUsedTick < found.LastUsedTick))
             {

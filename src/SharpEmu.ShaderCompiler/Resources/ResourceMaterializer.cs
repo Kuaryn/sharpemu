@@ -1306,7 +1306,10 @@ public static partial class ResourceMaterializer
             }
 
             var view = plan.HeapRecordSources[index];
-            heaps[index] = BindlessHeapDescriptor.FromWords(view.Sampler, words[index].Dwords, view.Immediate, view.R128);
+            heaps[index] = BindlessHeapDescriptor.FromWords(view.Sampler, words[index].Dwords, view.Immediate, view.R128) with
+            {
+                PointeeOffset = view.PointeeOffset,
+            };
         }
 
         return true;

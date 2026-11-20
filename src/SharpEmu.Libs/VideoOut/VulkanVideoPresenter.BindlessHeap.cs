@@ -723,7 +723,8 @@ internal static unsafe partial class VulkanVideoPresenter
             var order = entries.Snapshot ??= [.. entries.Order];
             var records = entries.Records ??= Array.ConvertAll(order, entry => entry.Index - region.View.First);
             Span<uint> scratch = stackalloc uint[8];
-            if (HeapBulkReadsActive)
+            // The records of a pointer view hold where each descriptor is, so each is read on its own.
+            if (HeapBulkReadsActive && region.Heap.PointeeOffset is null)
             {
                 var visitor = new HeapRunVisitor(this, order, region);
                 VisitHeapRuns(ref visitor, records, 0, order.Length, region.Heap.Sampler, (_heapRunBytes ??= new byte[HeapRunMaxBytes]).AsSpan(), scratch);
@@ -753,6 +754,16 @@ internal static unsafe partial class VulkanVideoPresenter
 
             var count = checked((int)(region.Heap.DescriptorBytes / sizeof(uint)));
             var address = region.View.DescriptorAddress(region.Heap, entry.Index - region.View.First);
+            if (region.Heap.PointeeOffset is not null)
+            {
+                // The record holds a pointer; the descriptor lies past its target.
+                Span<uint> pointer = stackalloc uint[2];
+                if (!_guestMemory.TryRead(address, MemoryMarshal.AsBytes(pointer)) || (address = region.Heap.PointeeAddress(pointer)) == 0)
+                {
+                    return 0;
+                }
+            }
+
             if (!_guestMemory.TryRead(address, MemoryMarshal.AsBytes(words[..count])))
             {
                 return 0;

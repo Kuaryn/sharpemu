@@ -122,6 +122,9 @@ public sealed record HeapRecordSelector(uint HeapSource, int KeyMemoryIndex, uin
     public bool Cube { get; init; }
 
     public bool R128 { get; init; }
+
+    // When set, the record's field at Immediate is a 64-bit pointer and the descriptor lies this many bytes past its target.
+    public uint? PointeeOffset { get; init; }
 }
 
 // One image access whose image or sampler is a heap record.
@@ -163,16 +166,32 @@ public sealed record CallRecordBufferWords(ScalarValue[] Words, bool Written);
 public sealed record CallRecordCallee(CallRecordField[] Fields, CallRecordBuffer[] Buffers, uint ArgumentBytes);
 
 // A heap view of a program: the heap V# the plan evaluates for every draw, whether its records hold samplers, the
-// immediate offset the program reads them at, and whether it reads them as 16-byte T#s (R128).
-public sealed record HeapRecordSource(uint Source, bool Sampler, uint Immediate = 0, bool R128 = false);
+// immediate offset the program reads them at, whether it reads them as 16-byte T#s (R128), and the descriptor's offset past
+// a pointer the records hold there (HeapRecordSelector.PointeeOffset).
+public sealed record HeapRecordSource(uint Source, bool Sampler, uint Immediate = 0, bool R128 = false, uint? PointeeOffset = null);
 
 // One heap view of a draw: the heap V#'s base address, record count and stride, the immediate offset of the view's reads,
-// and whether its descriptors are 16-byte T#s.
-public readonly record struct BindlessHeapDescriptor(bool Sampler, ulong Base, uint Records, uint Stride, uint Immediate = 0, bool R128 = false)
+// whether its descriptors are 16-byte T#s, and, when its records hold pointers instead, the descriptor's offset past the
+// pointer's target.
+public readonly record struct BindlessHeapDescriptor(bool Sampler, ulong Base, uint Records, uint Stride, uint Immediate = 0, bool R128 = false,
+    uint? PointeeOffset = null)
 {
-    // The size of the view's descriptor in a record.
+    public const uint PointerBytes = 8;
+
+    // The size of the view's descriptor.
     public uint DescriptorBytes =>
         Sampler ? BindlessHeap.SamplerRecordBytes : R128 ? BindlessHeap.R128RecordBytes : BindlessHeap.ImageRecordBytes;
+
+    // The size of the field a record holds for the view: the descriptor, or a pointer to it.
+    public uint FieldBytes => PointeeOffset is null ? DescriptorBytes : PointerBytes;
+
+    // Where the descriptor is that a record's pointer field (its two words) leads to; zero for a null pointer. A scalar
+    // load reads a 48-bit address.
+    public ulong PointeeAddress(ReadOnlySpan<uint> pointer)
+    {
+        var target = pointer[0] | ((ulong)(pointer[1] & 0xFFFF) << 32);
+        return target == 0 ? 0 : target + (PointeeOffset ?? 0);
+    }
 
     public static BindlessHeapDescriptor FromWords(bool sampler, ReadOnlySpan<uint> words, uint immediate = 0, bool r128 = false) =>
         new(sampler, words[0] | ((ulong)(words[1] & 0xFFFF) << 32), words[2], (words[1] >> 16) & 0x3FFF, immediate, r128);
@@ -182,7 +201,7 @@ public readonly record struct BindlessHeapDescriptor(bool Sampler, ulong Base, u
     // read's whole offset picks the descriptor, and at whatever count: a texture heap the guest streams more textures into
     // grows from frame to frame and stays one view (ViewRecords is the count a draw names). A record view is keyed by the
     // descriptor's offset in a record.
-    public BindlessHeapDescriptor ViewKey => Stride > DescriptorBytes
+    public BindlessHeapDescriptor ViewKey => Stride > FieldBytes
         ? this with { Immediate = Immediate % Stride }
         : this with { Records = 0, Immediate = 0 };
 
@@ -192,13 +211,13 @@ public readonly record struct BindlessHeapDescriptor(bool Sampler, ulong Base, u
     {
         get
         {
-            if (Stride > DescriptorBytes)
+            if (Stride > FieldBytes)
             {
                 return Records;
             }
 
             var bytes = Stride == 0 ? Records : (ulong)Records * Stride;
-            return (uint)Math.Min(bytes / DescriptorBytes, uint.MaxValue);
+            return (uint)Math.Min(bytes / FieldBytes, uint.MaxValue);
         }
     }
 }
@@ -230,9 +249,9 @@ public readonly record struct HeapView(uint First, uint Stride, uint FieldOffset
     // read as packed descriptors, whichever part of the offset the shader keeps in its key.
     public static HeapView Of(in BindlessHeapDescriptor heap, uint first, uint records)
     {
-        var descriptorBytes = heap.DescriptorBytes;
-        return heap.Stride <= descriptorBytes
-            ? new HeapView(first, descriptorBytes, 0, records)
+        var fieldBytes = heap.FieldBytes;
+        return heap.Stride <= fieldBytes
+            ? new HeapView(first, fieldBytes, 0, records)
             : new HeapView(first, heap.Stride, heap.Immediate % heap.Stride, records);
     }
 
